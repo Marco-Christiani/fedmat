@@ -1,0 +1,142 @@
+[project]
+name = "fedmat"
+version = "0.1.0"
+description = "Add your description here"
+#readme = "README.md"
+authors = [
+    { name = "Marco Christiani" }
+]
+requires-python = ">=3.10.1,<3.14"
+dependencies = [
+    "datasets>=4.4.1",
+    "numpy>=2.0.2",
+    "torch>=2.9.1",
+    "torchvision>=0.24.1",
+    "tqdm>=4.67.1",
+    "transformers>=4.57.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+    "ipywidgets>=8.1.8",
+    "ruff>=0.9.4",
+    "triton>=3.5.1",
+]
+
+[project.scripts]
+fedmat-train = "fedmat.train:main"
+
+[build-system]
+requires = ["uv_build>=0.8.14,<0.9.0"]
+build-backend = "uv_build"
+
+# [tool.hatch.build]
+# include = [
+#     "README.md",
+#     "src/*"
+# ]
+# 
+# [tool.hatch.build.targets.wheel]
+# packages = ["src/sf"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.ruff]
+line-length = 120
+preview = true
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+]
+
+[tool.ruff.lint]
+select = [
+    "ANN", # flake8 annotations (https/(/docs.astral.sh/ruff/rules/#flake8-annotations-ann))
+    "C", # McCabe complexity (https://docs.astral.sh/ruff/rules/#mccabe-c90)
+    "D", # pydocstyle (https://docs.astral.sh/ruff/rules/#pydocstyle-d)
+    "E", # pycodestyle (https://docs.astral.sh/ruff/rules/#warning-w)
+    "F401", # flakes unused import (https://docs.astral.sh/ruff/rules/unused-import/)
+    "F401", # flakes unused import (https://docs.astral.sh/ruff/rules/unused-import/)
+    "FURB", # refurb (https://docs.astral.sh/ruff/rules/#refurb-furb)
+    "I", # isort (https://docs.astral.sh/ruff/rules/#isort-i)
+    "I", # isort (https://docs.astral.sh/ruff/rules/#isort-i)
+    "ICN", # flake8-import-conventions (https://docs.astral.sh/ruff/rules/#flake8-import-conventions-icn)
+    "N", # PEP8 Naming (https://docs.astral.sh/ruff/rules/#pep8-naming-n)
+    "PD", # pandas-vet (https://docs.astral.sh/ruff/rules/#pandas-vet-pd)
+    "PERF", # perflint (https://docs.astral.sh/ruff/rules/#perflint-perf)
+    "RUF", # ruff-specific rules (https://docs.astral.sh/ruff/rules/#flake8-logging-log)
+    "SIM", # flake8-simplify (https://docs.astral.sh/ruff/rules/#flake8-simplify-sim)
+    "TCH", # flake8-type-checking (https://docs.astral.sh/ruff/rules/#flake8-type-checking-tch)
+    "TID", # flake8-tidy-imports (https://docs.astral.sh/ruff/rules/#flake8-tidy-imports-tid)
+    "W", # pycodestyle (https://docs.astral.sh/ruff/rules/#error-e)
+]
+ignore = [
+  "ANN002", # missing args type annotation (https://docs.astral.sh/ruff/rules/missing-type-args/)
+  "ANN003", # missing kwargs type annotation (https://docs.astral.sh/ruff/rules/missing-type-kwargs/#missing-type-kwargs-ann003)
+  "ANN101", # Missing type annotation for `self` in method
+  "ANN401", # more specific arg typing than Any (https://docs.astral.sh/ruff/rules/any-type/)
+  "D204", # https://docs.astral.sh/ruff/rules/one-blank-line-after-class/
+  "E402",   # imports at top of file (https://docs.astral.sh/ruff/rules/module-import-not-at-top-of-file/)
+  "PD901",  # Avoid using the generic variable name `df` for DataFrames []
+  "TRY003" # Avoid specifying long messages outside the exception class
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["D104", "F401"]      # Ignore some violations in all `__init__.py` files, and in selected subdirectories.
+"**/{tests,docs,tools}/*" = ["E402"]  # Ignore some violations in selected subdirectories.
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+testpaths = ["tests/"]
+verbosity = 2
+addopts = [
+  "--ff",
+  "--color=yes",
+  "--strict-markers",
+  "--doctest-modules",
+  "--import-mode=importlib",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+  "ignore::UserWarning",
+]
+log_cli = "True"
+markers = [
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: nocover",
+    "raise NotImplementedError",
+    "raise NotImplementedError()",
+    "if __name__ == .__main__.:",
+]
