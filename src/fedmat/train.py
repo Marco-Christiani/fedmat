@@ -10,7 +10,7 @@ from transformers import AutoImageProcessor, ViTForImageClassification, ViTImage
 
 from fedmat.data import build_dataloaders, load_cifar10_subsets
 from fedmat.evaluate import evaluate
-from fedmat.vit_utils import get_amp_settings, default_device, set_seed
+from fedmat.utils import get_amp_settings, default_device, set_seed
 ViTImageProcessor()
 if TYPE_CHECKING:
     from collections.abc import Iterable

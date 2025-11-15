@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 from tqdm.auto import tqdm
 
-from fedmat.vit_utils import get_amp_settings
+from fedmat.utils import get_amp_settings
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
