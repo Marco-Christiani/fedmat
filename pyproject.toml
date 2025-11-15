@@ -23,7 +23,6 @@ dev = [
     "nbformat>=5.10.4",
     "plotly>=6.4.0",
     "ruff>=0.9.4",
-    "triton>=3.5.1",
 ]
 
 [project.scripts]
