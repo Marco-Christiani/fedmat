@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import random
-from typing import TYPE_CHECKING, Any
+from typing import TypeVar
 
 import numpy as np
 import torch
 
+T = TypeVar('T')
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -26,5 +27,15 @@ def get_amp_settings(
         return True, torch.bfloat16
     return False, torch.float32
 
-
-
+def aos_to_soa(aos: list[dict[str, T]]) -> dict[str, list[T]]:
+    """AOS to SOA.
+    
+    Example:
+        >>> aos = [{'name': 'Alice', 'age': 25}, {'name': 'Bob', 'age': 30}]
+        >>> aos_to_soa(aos)
+        {'name': ['Alice', 'Bob'], 'age': [25, 30]}
+    """
+    if not aos:
+        return {}
+    
+    return {k: [record[k] for record in aos] for k in aos[0]}

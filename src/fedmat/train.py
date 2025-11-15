@@ -1,13 +1,17 @@
 from __future__ import annotations
-
+from collections import defaultdict
+import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from pprint import pformat
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import torch
 from tqdm.auto import tqdm
 from transformers import AutoImageProcessor, ViTForImageClassification, ViTImageProcessor
 
+from fedmat import utils
 from fedmat.data import build_dataloaders, load_cifar10_subsets
 from fedmat.evaluate import evaluate
 from fedmat.utils import get_amp_settings, default_device, set_seed
@@ -17,6 +21,7 @@ if TYPE_CHECKING:
 
     from torch import Tensor
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class TrainConfig:
@@ -43,12 +48,19 @@ class TrainConfig:
     output_dir: Path = Path("outputs/vit_cifar10")
 
 
+class MetricRecord(TypedDict):
+    epoch: int
+    step: int
+    loss: float
+
+Metrics = list[MetricRecord]
+
 def train(
     model: ViTForImageClassification,
     train_batches: Iterable[dict[str, Tensor]],
     device: torch.device,
     cfg: TrainConfig,
-) -> None:
+) -> Metrics:
     model.train()
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -57,7 +69,7 @@ def train(
     )
 
     use_autocast, amp_dtype = get_amp_settings(device, cfg.use_bf16)
-
+    metrics =[]
     for epoch in range(cfg.epochs):
         running_loss: float = 0.0
         step_count: int = 0
@@ -90,10 +102,16 @@ def train(
 
             if (step + 1) % cfg.log_every_n_steps == 0:
                 loss_val = float(loss.detach().cpu())
+                metrics.append({
+                    "epoch": epoch,
+                    "step": step,
+                    "loss": loss_val,
+                })
                 running_loss += loss_val
                 avg_loss = running_loss / ((running_loss != 0 and (step + 1) / cfg.log_every_n_steps) or 1.0)
                 if isinstance(train_iter, tqdm):
                     train_iter.set_postfix(loss=f"{avg_loss:.4f}")
+    return metrics
 
 def main():
     """Vanilla train ViT on CIFAR-10."""
@@ -108,7 +126,7 @@ def main():
         use_torch_compile=False,
         output_dir=Path("outputs/vit_cifar10"),
     )
-    print(cfg)
+    logger.info(pformat(cfg))
 
     if cfg is None:
         cfg = TrainConfig()
@@ -117,12 +135,11 @@ def main():
     set_seed(cfg.seed)
 
     device = default_device()
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
 
     train_ds, eval_ds  = load_cifar10_subsets(max_train_samples=cfg.max_train_samples, max_eval_samples=cfg.max_eval_samples)
 
     image_processor = AutoImageProcessor.from_pretrained(cfg.model_name)
-    print(type(image_processor))
 
     model: ViTForImageClassification = ViTForImageClassification.from_pretrained(
         cfg.model_name,
@@ -150,10 +167,17 @@ def main():
         device=device,
     )
 
-    train(model, train_batches, device, cfg)
-    accuracy = evaluate(model, eval_batches, device, enable_bf16=cfg.use_bf16)
+    metrics_train = train(model, train_batches, device, cfg)
+    metrics = defaultdict(dict)
+    metrics["train"] = utils.aos_to_soa(metrics_train)
 
-    print(f"Evaluation accuracy: {accuracy:.4f}")
+    accuracy = evaluate(model, eval_batches, device, enable_bf16=cfg.use_bf16)
+    metrics["eval"]["accuracy"] = accuracy
+    logger.info(f"Saving metrics: {metrics!s}")
+    with cfg.output_dir.joinpath("metrics.json").open("w") as f:
+        json.dump(metrics, fp=f, indent=2)
+
+    logger.info(f"Evaluation accuracy: {accuracy:.4f}")
     return accuracy
 
 
