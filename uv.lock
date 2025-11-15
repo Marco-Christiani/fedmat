@@ -437,6 +437,7 @@ dependencies = [
     { name = "torchvision" },
     { name = "tqdm" },
     { name = "transformers" },
+    { name = "triton", marker = "sys_platform == 'linux'" },
 ]
 
 [package.dev-dependencies]
@@ -446,7 +447,6 @@ dev = [
     { name = "nbformat" },
     { name = "plotly" },
     { name = "ruff" },
-    { name = "triton" },
 ]
 
 [package.metadata]
@@ -457,6 +457,7 @@ requires-dist = [
     { name = "torchvision", specifier = ">=0.24.1" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "transformers", specifier = ">=4.57.1" },
+    { name = "triton", marker = "sys_platform == 'linux'", specifier = ">=3.5.1" },
 ]
 
 [package.metadata.requires-dev]
@@ -466,7 +467,6 @@ dev = [
     { name = "nbformat", specifier = ">=5.10.4" },
     { name = "plotly", specifier = ">=6.4.0" },
     { name = "ruff", specifier = ">=0.9.4" },
-    { name = "triton", specifier = ">=3.5.1" },
 ]
 
 [[package]]
