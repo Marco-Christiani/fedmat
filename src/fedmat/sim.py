@@ -46,9 +46,10 @@ class TransformerBlock(nn.Module):
     def __init__(self, num_heads, head_dim, mlp_hidden_dim, embed_dim=None, causal=False):
         super().__init__()
         self.mha = MHA(num_heads, head_dim, embed_dim, causal)
-        self.mlp = MLP(embed_dim if embed_dim is not None else num_heads * head_dim, mlp_hidden_dim)
-        self.ln1 = nn.LayerNorm(embed_dim if embed_dim is not None else num_heads * head_dim)
-        self.ln2 = nn.LayerNorm(embed_dim if embed_dim is not None else num_heads * head_dim)
+        emb = embed_dim if embed_dim is not None else num_heads * head_dim
+        self.mlp = MLP(emb, mlp_hidden_dim)
+        self.ln1 = nn.LayerNorm(emb)
+        self.ln2 = nn.LayerNorm(emb)
 
     def forward(self, x):
         x = x + self.mha(self.ln1(x))
@@ -59,7 +60,9 @@ class Transformer(nn.Module):
     def __init__(self, num_layers=2, num_heads=4, d_model=16):
         super().__init__()
         self.layers = nn.ModuleList([
-            TransformerBlock(num_heads, d_model // num_heads, mlp_hidden_dim=4 * d_model, embed_dim=d_model)
+            TransformerBlock(num_heads, d_model // num_heads,
+                             mlp_hidden_dim=4 * d_model,
+                             embed_dim=d_model)
             for _ in range(num_layers)
         ])
         self.out = nn.Linear(d_model, d_model)
@@ -70,18 +73,25 @@ class Transformer(nn.Module):
         x = self.out(x)
         return x
 
-
 def permute_heads_layer(layer: TransformerBlock, perm: torch.Tensor):
-    with torch.no_grad():
-        H = layer.mha.num_heads
-        hd = layer.mha.head_dim
-        D = H * hd
+    mha = layer.mha
+    H = mha.num_heads
+    hd = mha.head_dim
 
-        qkv = layer.mha.qkv.data
-        qkv = qkv.view(D, 3, H, hd)
+    with torch.no_grad():
+        embed_dim = mha.qkv.shape[0]
+        qkv = mha.qkv.data.view(embed_dim, 3, H, hd)
         qkv = qkv[:, :, perm, :]
-        qkv = qkv.view(D, 3 * D)
-        layer.mha.qkv.data.copy_(qkv)
+        qkv = qkv.contiguous().view(embed_dim, 3 * H * hd)
+        mha.qkv.data.copy_(qkv)
+
+        W = mha.o_proj.weight.data
+        out_features, in_features = W.shape
+        assert in_features == H * hd
+        W = W.view(out_features, H, hd)
+        W = W[:, perm, :]
+        W = W.contiguous().view(out_features, H * hd)
+        mha.o_proj.weight.data.copy_(W)
 
 def apply_random_permutation_to_model_heads(model: Transformer, p=1.0):
     for layer in model.layers:
@@ -108,13 +118,29 @@ def average_models(models):
     base.load_state_dict(avg_state)
     return base
 
+def flatten_heads_for_matching(layer: TransformerBlock) -> torch.Tensor:
+    mha = layer.mha
+    H = mha.num_heads
+    hd = mha.head_dim
+
+    embed_dim = mha.qkv.shape[0]
+    qkv = mha.qkv.data.view(embed_dim, 3, H, hd)
+    qkv_heads = qkv.permute(2, 0, 1, 3).contiguous().view(H, -1)
+
+    W = mha.o_proj.weight.data
+    out_features, in_features = W.shape
+    assert in_features == H * hd
+    W = W.view(out_features, H, hd)
+    W_heads = W.permute(1, 0, 2).contiguous().view(H, -1)
+
+    return torch.cat([qkv_heads, W_heads], dim=1)
 
 def align_client_to_ref(client: Transformer, ref: Transformer):
     for ref_layer, cli_layer in zip(ref.layers, client.layers):
         H = ref_layer.mha.num_heads
 
-        ref_flat = ref_layer.mha.qkv.data.view(H, -1)
-        cli_flat = cli_layer.mha.qkv.data.view(H, -1)
+        ref_flat = flatten_heads_for_matching(ref_layer)
+        cli_flat = flatten_heads_for_matching(cli_layer)
 
         cost = torch.cdist(ref_flat, cli_flat, p=2)
 
@@ -125,13 +151,14 @@ def align_client_to_ref(client: Transformer, ref: Transformer):
             best_j = min(unused, key=lambda j: row[j].item())
             perm[i] = best_j
             unused.remove(best_j)
+
         permute_heads_layer(cli_layer, perm)
 
     return client
 
 def align_all_clients_to_first(clients):
     ref = clients[0]
-    aligned = [clients[0]]
+    aligned = [copy.deepcopy(ref)]
     for c in clients[1:]:
         aligned.append(align_client_to_ref(copy.deepcopy(c), ref))
     return aligned
@@ -154,8 +181,14 @@ def main():
     num_clients = 8
 
     global_model = Transformer(num_layers=num_layers, num_heads=num_heads, d_model=d_model)
+    
+    clients = make_clients_from_global(
+        global_model,
+        num_clients=num_clients,
+        noise_std=0.1,
+        perm_prob=0.7,
+    )
 
-    clients = make_clients_from_global(global_model, num_clients=num_clients, noise_std=0.1, perm_prob=0.7)
     naive_agg = average_models(clients)
 
     aligned_clients = align_all_clients_to_first(clients)
@@ -165,7 +198,7 @@ def main():
     dist_aligned = model_param_distance(global_model, aligned_agg)
 
     print("Parameter distance to original global model:")
-    print(f" - Naive FedAvg: {dist_naive:.4f}")
+    print(f" - Naive FedAvg:        {dist_naive:.4f}")
     print(f" - Head-aligned FedAvg: {dist_aligned:.4f}")
 
     x = torch.randn(128, d_model)
@@ -178,7 +211,7 @@ def main():
     mse_aligned = F.mse_loss(y_aligned, y_true).item()
 
     print("\nOutput MSE vs original global model on random data:")
-    print(f" - Naive FedAvg: {mse_naive:.6f}")
+    print(f" - Naive FedAvg:        {mse_naive:.6f}")
     print(f" - Head-aligned FedAvg: {mse_aligned:.6f}")
 
 if __name__ == "__main__":
