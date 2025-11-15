@@ -19,13 +19,14 @@ def evaluate(
     eval_batches: Iterable[dict[str, torch.Tensor]],
     device: torch.device,
     enable_bf16: bool,
-) -> float:
+) -> tuple[float, torch.Tensor]:
     _ = model.eval()
     use_autocast, amp_dtype = get_amp_settings(device, enable_bf16)
 
-    # device side counters to reduce syncs
     correct = torch.zeros((), device=device, dtype=torch.long)
     total = torch.zeros((), device=device, dtype=torch.long)
+    num_labels = model.config.num_labels
+    conf = torch.zeros((num_labels, num_labels), device=device, dtype=torch.long)
 
     eval_iter = eval_batches
     if hasattr(eval_batches, "__len__"):
@@ -45,7 +46,9 @@ def evaluate(
         preds = outputs.logits.argmax(dim=-1)  # [B]
         correct += (preds == labels).sum()
         total += labels.size(0)
+        idx = labels * num_labels + preds
+        conf.view(-1).index_add_(0, idx, torch.ones_like(idx, dtype=torch.long))
 
     accuracy_tensor = correct.float() / total.clamp_min(1).float()
     accuracy = float(accuracy_tensor.cpu())  # single sync
-    return accuracy
+    return accuracy, conf

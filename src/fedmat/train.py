@@ -1,20 +1,22 @@
 from __future__ import annotations
-from collections import defaultdict
+
 import json
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from pprint import pformat
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 import torch
 from tqdm.auto import tqdm
-from transformers import AutoImageProcessor, ViTForImageClassification, ViTImageProcessor
+from transformers import AutoImageProcessor, ViTConfig, ViTForImageClassification
 
 from fedmat import utils
 from fedmat.data import build_dataloaders, load_cifar10_subsets
 from fedmat.evaluate import evaluate
-from fedmat.utils import get_amp_settings, default_device, set_seed
+from fedmat.utils import default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -46,6 +48,7 @@ class TrainConfig:
     use_torch_compile: bool = False
 
     output_dir: Path = Path("outputs/vit_cifar10")
+    use_pretrained: bool = True
 
 
 class MetricRecord(TypedDict):
@@ -69,6 +72,7 @@ def train(
     )
 
     use_autocast, amp_dtype = get_amp_settings(device, cfg.use_bf16)
+    global_step = 0
     metrics =[]
     for epoch in range(cfg.epochs):
         running_loss: float = 0.0
@@ -81,6 +85,7 @@ def train(
 
         for step, batch in enumerate(train_iter):
             step_count += 1
+            global_step += 1
 
             pixel_values = batch["pixel_values"].to(device)
             labels = batch["labels"].to(device)
@@ -105,6 +110,7 @@ def train(
                 metrics.append({
                     "epoch": epoch,
                     "step": step,
+                    "global_step": global_step,
                     "loss": loss_val,
                 })
                 running_loss += loss_val
@@ -116,15 +122,16 @@ def train(
 def main():
     """Vanilla train ViT on CIFAR-10."""
     cfg = TrainConfig(
-        epochs=5,
-        batch_size=64,
-        max_train_samples=8_000,
-        max_eval_samples=1_000,
+        epochs=10,
+        batch_size=128,
+        max_train_samples=None,
+        max_eval_samples=None,
         num_workers=4,
         prefetch_factor=4,
         use_bf16=True,
         use_torch_compile=False,
         output_dir=Path("outputs/vit_cifar10"),
+        use_pretrained=False,
     )
     logger.info(pformat(cfg))
 
@@ -141,12 +148,18 @@ def main():
 
     image_processor = AutoImageProcessor.from_pretrained(cfg.model_name)
 
-    model: ViTForImageClassification = ViTForImageClassification.from_pretrained(
-        cfg.model_name,
-        num_labels=cfg.num_labels,
-        # ignore_mismatched_sizes=True,  # re-init classification head
-        # device_map=device,
-    )
+    if cfg.use_pretrained:
+        logger.info("Using pretrained")
+        model = ViTForImageClassification.from_pretrained(cfg.model_name, num_labels=cfg.num_labels)
+    else:
+        logger.info("Not using pretrained")
+        model: ViTForImageClassification = ViTForImageClassification(
+            ViTConfig(
+                num_labels=cfg.num_labels,
+            )
+        )
+
+    logger.info("Model:\n%s", pformat(model))
 
     model.config.id2label = {i: str(i) for i in range(cfg.num_labels)}
     model.config.label2id = {str(i): i for i in range(cfg.num_labels)}
@@ -171,11 +184,23 @@ def main():
     metrics = defaultdict(dict)
     metrics["train"] = utils.aos_to_soa(metrics_train)
 
-    accuracy = evaluate(model, eval_batches, device, enable_bf16=cfg.use_bf16)
+    accuracy, confmat = evaluate(model, eval_batches, device, enable_bf16=cfg.use_bf16)
     metrics["eval"]["accuracy"] = accuracy
-    logger.info(f"Saving metrics: {metrics!s}")
-    with cfg.output_dir.joinpath("metrics.json").open("w") as f:
+    now = datetime.now().isoformat()
+    logger.info(f"metrics:\n {metrics!s}")
+
+    fpath = cfg.output_dir.joinpath(f"metrics-{now}.json")
+    logger.info(f"Saving metrics: {fpath!s}")
+    with fpath.open("w") as f:
         json.dump(metrics, fp=f, indent=2)
+
+    fpath = cfg.output_dir / f"confusion_matrix-{now}.pt"
+    logger.info(f"Saving confusion matrix data to {fpath!s}")
+    torch.save(confmat.cpu(), fpath)
+
+    ckpt_path = cfg.output_dir / f"model-{now}.pt"
+    logger.info(f"Saving checkpoint to {ckpt_path}")
+    torch.save(model.state_dict(), ckpt_path)
 
     logger.info(f"Evaluation accuracy: {accuracy:.4f}")
     return accuracy
