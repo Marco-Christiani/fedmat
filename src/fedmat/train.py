@@ -11,7 +11,7 @@ from transformers import AutoImageProcessor, ViTForImageClassification, ViTImage
 from fedmat.data import build_dataloaders, load_cifar10_subsets
 from fedmat.evaluate import evaluate
 from fedmat.utils import get_amp_settings, default_device, set_seed
-ViTImageProcessor()
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -150,7 +150,6 @@ def main():
         device=device,
     )
 
-    print("Skipping train...")
     train(model, train_batches, device, cfg)
     accuracy = evaluate(model, eval_batches, device, enable_bf16=cfg.use_bf16)
 
