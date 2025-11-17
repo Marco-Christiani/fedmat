@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from argparse import ArgumentParser
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -121,18 +122,22 @@ def train(
 
 def main():
     """Vanilla train ViT on CIFAR-10."""
-    cfg = TrainConfig(
-        epochs=10,
-        batch_size=128,
-        max_train_samples=None,
-        max_eval_samples=None,
-        num_workers=4,
-        prefetch_factor=4,
-        use_bf16=True,
-        use_torch_compile=False,
-        output_dir=Path("outputs/vit_cifar10"),
-        use_pretrained=False,
-    )
+    parser = ArgumentParser(
+            prog='fedmat_train',
+            description='Train a round of FedMAT',
+            epilog='Copyright 2025 (TM) OC do not steal')
+    parser.add_argument('-e', '--epochs', type=int, default=10)
+    parser.add_argument('-bs', '--batch-size', type=int, default=128)
+    parser.add_argument('-mts', '--max-train-samples', type=int)
+    parser.add_argument('-mes', '--max-eval-samples', type=int)
+    parser.add_argument('-nw', '--num-workers', type=int, default=4)
+    parser.add_argument('-pf', '--prefetch-factor', type=int, default=4)
+    parser.add_argument('-bf16', '--use-bf16', action='store_true')
+    parser.add_argument('-tc', '--use-torch-compile', action='store_true')
+    parser.add_argument('-o', '--output-dir', type=Path, default=Path("outputs/vit_cifar10"))
+    parser.add_argument('-pre', '--use-pretrained', action='store_true')
+    args = parser.parse_args()
+    cfg = TrainConfig(**vars(args))
     logger.info(pformat(cfg))
 
     if cfg is None:
