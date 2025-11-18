@@ -8,15 +8,16 @@ from tqdm.auto import tqdm
 from fedmat.utils import get_amp_settings
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-
+    from torch.utils.data import DataLoader
     from transformers import ViTForImageClassification
+
+    from .data import Batch
 
 
 @torch.inference_mode()
 def evaluate(
     model: ViTForImageClassification,
-    eval_batches: Iterable[dict[str, torch.Tensor]],
+    dataloader: DataLoader[Batch],
     device: torch.device,
     enable_bf16: bool,
 ) -> tuple[float, torch.Tensor]:
@@ -28,11 +29,7 @@ def evaluate(
     num_labels = model.config.num_labels
     conf = torch.zeros((num_labels, num_labels), device=device, dtype=torch.long)
 
-    eval_iter = eval_batches
-    if hasattr(eval_batches, "__len__"):
-        eval_iter = tqdm(eval_batches, desc="Evaluating")
-
-    for batch in eval_iter:
+    for batch in tqdm(dataloader, desc="Evaluating"):
         labels = batch["labels"].to(device=model.device)
 
         with torch.autocast(

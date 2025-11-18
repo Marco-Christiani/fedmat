@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sized
 from typing import TYPE_CHECKING
 
 import torch
-from datasets import Dataset, load_dataset
-from torch.utils.data import DataLoader, Sampler, RandomSampler
-from torch.distributions import Dirichlet, Categorical, Uniform
+from datasets import Dataset, DatasetDict, load_dataset
+from torch import Tensor
+from torch.distributions import Categorical, Dirichlet
+from torch.utils.data import DataLoader, RandomSampler, Sampler
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
-    from typing import Any, Dict
+    from collections.abc import Iterator
+    from typing import Any
 
-    from torch import Tensor
     from transformers import AutoImageProcessor
+
+Batch = dict[str, Tensor]
 
 
 def load_cifar10_subsets(
@@ -21,8 +24,8 @@ def load_cifar10_subsets(
     max_eval_samples: int | None,
 ) -> tuple[Dataset, Dataset]:
     """Load CIFAR-10 and apply optional subset selection."""
-
     raw_ds = load_dataset("cifar10")
+    assert isinstance(raw_ds, DatasetDict)
 
     train_ds: Dataset = raw_ds["train"]
     eval_ds: Dataset = raw_ds["test"]
@@ -46,9 +49,8 @@ def build_dataloaders(
     num_workers: int,
     prefetch_factor: int,
     device: torch.device,
-) -> tuple[List[Iterable[dict[str, Tensor]]], Iterable[dict[str, Tensor]]]:
-    """Create DataLoaders and wrap them with CUDA prefetching when applicable. """
-
+) -> tuple[list[DataLoader[Batch]], DataLoader[Batch]]:
+    """Create DataLoaders and wrap them with CUDA prefetching when applicable."""
     collate_fn = Collator(image_processor)
     pin_memory = device.type == "cuda"
 
@@ -63,27 +65,33 @@ def build_dataloaders(
     if num_workers > 0:
         common_kwargs["prefetch_factor"] = prefetch_factor
 
-    train_loaders = [DataLoader(
-        train_ds,
-        sampler=sampler,
-        **common_kwargs,
-    ) for sampler in partition_by_client(
-        (train_ds[i]["label"] for i in range(len(train_ds))),
-        num_clients,
-        homogeneity,
-    )]
+    train_loaders = [
+        DataLoader(
+            train_ds,
+            sampler=sampler,
+            **common_kwargs,
+        )
+        for sampler in partition_by_client(
+            (train_ds[i]["label"] for i in range(len(train_ds))),
+            num_clients,
+            homogeneity,
+        )
+    ]
     eval_loader = DataLoader(
         eval_ds,
         shuffle=False,
         **common_kwargs,
     )
+    assert isinstance(train_loaders[0], Sized)
+    assert isinstance(eval_loader, Sized)
     return train_loaders, eval_loader
+
 
 class Collator:
     def __init__(
         self,
         image_processor: AutoImageProcessor,
-    ):  #-> Callable[[list[dict[str, Any]]], dict[str, torch.Tensor]]:
+    ):  # -> Callable[[list[dict[str, Any]]], dict[str, torch.Tensor]]:
         self.image_processor = image_processor
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
@@ -99,7 +107,8 @@ class Collator:
             "labels": labels,
         }
 
-def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 1.0) -> List[Sampler]:
+
+def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 1.0) -> list[Sampler]:
     class_indices = partition_by_labels(labels)
     dirichlet = Dirichlet(alpha * torch.ones(num_clients) / num_clients)
     client_indices = [list() for _ in range(num_clients)]
@@ -110,7 +119,8 @@ def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 
             client_indices[assignments].append(i)
     return [RandomSampler(indices) for indices in client_indices]
 
-def partition_by_labels(labels: Iterator[int]) -> List[List[int]]:
+
+def partition_by_labels(labels: Iterator[int]) -> list[list[int]]:
     class_indices = defaultdict(list)
     num_classes = 0
     for i, class_ in enumerate(labels):
@@ -119,8 +129,9 @@ def partition_by_labels(labels: Iterator[int]) -> List[List[int]]:
     class_indices = [class_indices[i] for i in range(num_classes)]
     return class_indices
 
+
 class DirichletSampler(Sampler):
-    def __init__(self, class_indices: List[List[int]], alpha: float = 0.0):
+    def __init__(self, class_indices: list[list[int]], alpha: float = 0.0):
         super().__init__()
 
         num_classes = len(class_indices)
@@ -130,8 +141,7 @@ class DirichletSampler(Sampler):
         dirichlet = Dirichlet(alpha * concentration)
 
         self.class_indices = [
-            torch.as_tensor(class_indices[i])[torch.randperm(class_sizes[i])]
-            for i in range(num_classes)
+            torch.as_tensor(class_indices[i])[torch.randperm(class_sizes[i])] for i in range(num_classes)
         ]
         self.class_sizes = class_sizes
         self.dataset_size = dataset_size

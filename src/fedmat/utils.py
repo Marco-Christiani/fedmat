@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import random
-from typing import TypeVar
+from collections.abc import Mapping, Sequence
+from typing import Any, TypeVar
 
 import numpy as np
 import torch
 
-T = TypeVar('T')
+T = TypeVar("T", bound=Mapping[str, Any])
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -27,7 +29,8 @@ def get_amp_settings(
         return True, torch.bfloat16
     return False, torch.float32
 
-def aos_to_soa(aos: list[dict[str, T]]) -> dict[str, list[T]]:
+
+def aos_to_soa(aos: Sequence[T]) -> dict[str, list[Any]]:
     """AOS to SOA.
     
     Example:
@@ -37,5 +40,5 @@ def aos_to_soa(aos: list[dict[str, T]]) -> dict[str, list[T]]:
     """
     if not aos:
         return {}
-    
+
     return {k: [record[k] for record in aos] for k in aos[0]}

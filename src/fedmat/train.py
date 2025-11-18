@@ -4,7 +4,7 @@ import json
 import logging
 from argparse import ArgumentParser
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from pprint import pformat
@@ -14,60 +14,70 @@ import torch
 from tqdm.auto import tqdm
 from transformers import AutoImageProcessor, ViTConfig, ViTForImageClassification
 
-from fedmat import utils
-from fedmat.data import build_dataloaders, load_cifar10_subsets
-from fedmat.evaluate import evaluate
-from fedmat.utils import default_device, get_amp_settings, set_seed
+import wandb
+
+from . import utils
+from .data import Batch, build_dataloaders, load_cifar10_subsets
+from .evaluate import evaluate
+from .utils import default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-
     from torch import Tensor
+    from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class TrainConfig:
     """Config for ViT fine-tuning on CIFAR-10."""
 
+    use_wandb: bool = True
+    run_name: str | None = None
+    seed: int = 42
+
     model_name: str = "google/vit-base-patch16-224-in21k"
+    use_pretrained: bool = True
     num_labels: int = 10
+
     learning_rate: float = 5e-4
     weight_decay: float = 0.01
     batch_size: int = 64
     epochs: int = 5
-    seed: int = 42
-
-    max_train_samples: int | None = 8_000
-    max_eval_samples: int | None = 1_000
-
-    num_workers: int = 4
-    prefetch_factor: int = 4
+    max_grad_norm: float | None = None
     log_every_n_steps: int = 50
-
     use_bf16: bool = True
     use_torch_compile: bool = False
 
+    max_train_samples: int | None = 8_000
+    max_eval_samples: int | None = 1_000
+    num_workers: int = 4
+    prefetch_factor: int = 4
+
     output_dir: Path = Path("outputs/vit_cifar10")
-    use_pretrained: bool = True
 
     homogeneity: float = 1.0
     num_clients: int = 1
 
+
 class MetricRecord(TypedDict):
     epoch: int
+    global_step: int
     step: int
     loss: float
 
+
 Metrics = list[MetricRecord]
+
 
 def train(
     model: ViTForImageClassification,
-    train_batches: Iterable[dict[str, Tensor]],
+    dataloader: DataLoader[Batch],
     device: torch.device,
     cfg: TrainConfig,
 ) -> Metrics:
     model.train()
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.learning_rate,
@@ -75,85 +85,162 @@ def train(
     )
 
     use_autocast, amp_dtype = get_amp_settings(device, cfg.use_bf16)
+
+    n_batches = len(dataloader)
+    total_steps = cfg.epochs * n_batches
+
+    metrics_loss_gpu: Tensor = torch.empty(
+        total_steps,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    metrics_meta: list[MetricRecord] = []  # cpu
+
     global_step = 0
-    metrics =[]
-    for epoch in range(cfg.epochs):
-        running_loss: float = 0.0
-        step_count: int = 0
 
-        # tqdm over a known-length iterable if available
-        train_iter = train_batches
-        if hasattr(train_batches, "__len__"):
-            train_iter = tqdm(train_batches, desc=f"Epoch {epoch + 1}/{cfg.epochs}")
+    best_loss: float = float("inf")
 
-        for step, batch in enumerate(train_iter):
-            step_count += 1
-            global_step += 1
+    try:
+        for epoch in range(cfg.epochs):
+            running_loss_gpu: Tensor = torch.zeros((), device=device)
+            steps_since_log = 0
 
-            pixel_values = batch["pixel_values"].to(device)
-            labels = batch["labels"].to(device)
+            progress = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{cfg.epochs}")
 
-            with torch.autocast(
-                device_type=device.type,
-                dtype=amp_dtype,
-                enabled=use_autocast,
-            ):
-                outputs = model(
-                    pixel_values=pixel_values,  # [B, C, H, W]
-                    labels=labels,              # [B]
-                )
-                loss = outputs.loss
+            for step, batch in enumerate(progress):
+                global_step += 1
+                steps_since_log += 1
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+                pixel_values = batch["pixel_values"].to(device)
+                labels = batch["labels"].to(device)
 
-            if (step + 1) % cfg.log_every_n_steps == 0:
-                loss_val = float(loss.detach().cpu())
-                metrics.append({
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=amp_dtype,
+                    enabled=use_autocast,
+                ):
+                    outputs = model(
+                        pixel_values=pixel_values,  # (B, C, H, W)
+                        labels=labels,  # (B,)
+                    )
+                    loss = outputs.loss
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+
+                if cfg.max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+
+                optimizer.step()
+
+                metrics_loss_gpu[global_step - 1] = loss.detach()
+                metrics_meta.append({
                     "epoch": epoch,
                     "step": step,
                     "global_step": global_step,
-                    "loss": loss_val,
+                    "loss": float("nan"),  # placeholder
                 })
-                running_loss += loss_val
-                avg_loss = running_loss / ((running_loss != 0 and (step + 1) / cfg.log_every_n_steps) or 1.0)
-                if isinstance(train_iter, tqdm):
-                    train_iter.set_postfix(loss=f"{avg_loss:.4f}")
-    return metrics
+
+                if global_step % cfg.log_every_n_steps == 0:
+                    running_loss_gpu += loss.detach()
+                    avg_loss_gpu = running_loss_gpu / steps_since_log
+                    avg_loss = float(avg_loss_gpu.item())
+                    progress.set_postfix(loss=f"{avg_loss:.4f}")
+                    if cfg.use_wandb:
+                        wandb.log(
+                            {
+                                "train/loss": avg_loss,
+                                "train/epoch": epoch,
+                                "train/step": step,
+                                "train/global_step": global_step,
+                                "train/lr": optimizer.param_groups[0]["lr"],
+                            },
+                            step=global_step,
+                        )
+
+                    if avg_loss < best_loss:  # new best
+                        best_loss = avg_loss
+                        ckpt_path = cfg.output_dir / "best.pt"
+                        torch.save(
+                            {
+                                "model": model.state_dict(),
+                                "optimizer": optimizer.state_dict(),
+                                "epoch": epoch,
+                                "global_step": global_step,
+                            },
+                            ckpt_path,
+                        )
+                        if cfg.use_wandb:
+                            artifact = wandb.Artifact("best-model", type="model")
+                            artifact.add_file(ckpt_path)
+                            wandb.log_artifact(artifact)
+
+                    # reset local running stats
+                    running_loss_gpu.zero_()
+                    steps_since_log = 0
+
+    finally:
+        # sync and fill
+        loss_list_cpu = metrics_loss_gpu.cpu().tolist()
+        for rec in metrics_meta:
+            rec["loss"] = loss_list_cpu[rec["global_step"] - 1]
+
+        if cfg.use_wandb:
+            wandb.summary["final/loss"] = loss_list_cpu[-1]
+            wandb.summary["best/loss"] = best_loss
+
+    return metrics_meta
+
 
 def main():
     """Vanilla train ViT on CIFAR-10."""
     parser = ArgumentParser(
-            prog='fedmat_train',
-            description='Train a round of FedMAT',
-            epilog='Copyright 2025 (TM) OC do not steal')
-    parser.add_argument('-e', '--epochs', type=int, default=10)
-    parser.add_argument('-bs', '--batch-size', type=int, default=128)
-    parser.add_argument('-mts', '--max-train-samples', type=int)
-    parser.add_argument('-mes', '--max-eval-samples', type=int)
-    parser.add_argument('-nw', '--num-workers', type=int, default=4)
-    parser.add_argument('-pf', '--prefetch-factor', type=int, default=4)
-    parser.add_argument('-bf16', '--use-bf16', action='store_true')
-    parser.add_argument('-tc', '--use-torch-compile', action='store_true')
-    parser.add_argument('-o', '--output-dir', type=Path, default=Path("outputs/vit_cifar10"))
-    parser.add_argument('-pre', '--use-pretrained', action='store_true')
-    parser.add_argument('-alpha', '--homogeneity', type=float, default=1.0)
-    parser.add_argument('-c', '--num-clients', type=int, default=1)
+        prog="fedmat_train",
+        description="Train a round of FedMAT",
+        epilog="Copyright 2025 (TM) OC do not steal",
+    )
+    parser.add_argument("-e", "--epochs", type=int, default=TrainConfig.epochs)
+    parser.add_argument("-bs", "--batch-size", type=int, default=TrainConfig.batch_size)
+    parser.add_argument("-mts", "--max-train-samples", type=int)
+    parser.add_argument("-mes", "--max-eval-samples", type=int)
+    parser.add_argument("-nw", "--num-workers", type=int, default=TrainConfig.num_workers)
+    parser.add_argument("-pf", "--prefetch-factor", type=int, default=TrainConfig.prefetch_factor)
+    parser.add_argument("-bf16", "--use-bf16", action="store_true")
+    parser.add_argument("-tc", "--use-torch-compile", action="store_true")
+    parser.add_argument("-o", "--output-dir", type=Path, default=TrainConfig.output_dir)
+    parser.add_argument("-pre", "--use-pretrained", action="store_true")
+    parser.add_argument("-rn", "--run-name", type=str, default=TrainConfig.run_name)
+    parser.add_argument("-alpha", "--homogeneity", type=float, default=1.0)
+    parser.add_argument("-c", "--num-clients", type=int, default=1)
+
     args = parser.parse_args()
     cfg = TrainConfig(**vars(args))
     logger.info(pformat(cfg))
 
-    if cfg is None:
-        cfg = TrainConfig()
-
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     set_seed(cfg.seed)
+
+    if cfg.use_wandb:
+        import wandb
+
+        run = wandb.init(
+            entity="fedmat-team",
+            project="fedmat-project",
+            name=cfg.run_name,
+            config=asdict(cfg),
+            mode="online",
+            dir=str(cfg.output_dir),  # wandb files in run dir for now
+        )
+    else:
+        run = None
 
     device = default_device()
     logger.info(f"Using device: {device}")
 
-    train_ds, eval_ds  = load_cifar10_subsets(max_train_samples=cfg.max_train_samples, max_eval_samples=cfg.max_eval_samples)
+    train_ds, eval_ds = load_cifar10_subsets(
+        max_train_samples=cfg.max_train_samples, max_eval_samples=cfg.max_eval_samples
+    )
 
     image_processor = AutoImageProcessor.from_pretrained(cfg.model_name)
 
@@ -173,10 +260,9 @@ def main():
     model.config.id2label = {i: str(i) for i in range(cfg.num_labels)}
     model.config.label2id = {str(i): i for i in range(cfg.num_labels)}
 
-    _ = model.to(device) # pyright: ignore[reportArgumentType] upstream typing issue
+    _ = model.to(device)
 
     if cfg.use_torch_compile:
-        # model = torch.compile(model)
         model.compile()
 
     clients_train_batches, eval_batches = build_dataloaders(
@@ -192,12 +278,16 @@ def main():
     )
     train_batches = clients_train_batches[0]
 
+    # Train
     metrics_train = train(model, train_batches, device, cfg)
     metrics = defaultdict(dict)
     metrics["train"] = utils.aos_to_soa(metrics_train)
 
+    # Eval
     accuracy, confmat = evaluate(model, eval_batches, device, enable_bf16=cfg.use_bf16)
     metrics["eval"]["accuracy"] = accuracy
+
+    # Save
     now = datetime.now().isoformat()
     logger.info(f"metrics:\n {metrics!s}")
 
@@ -215,9 +305,14 @@ def main():
     torch.save(model.state_dict(), ckpt_path)
 
     logger.info(f"Evaluation accuracy: {accuracy:.4f}")
+
+    if run:
+        wandb.summary["eval/accuracy"] = accuracy
+        wandb.save(str(ckpt_path))
+        run.finish()
+
     return accuracy
 
 
 if __name__ == "__main__":
     main()
-
