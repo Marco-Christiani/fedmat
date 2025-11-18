@@ -32,7 +32,6 @@ class TrainConfig:
 
     model_name: str = "google/vit-base-patch16-224-in21k"
     num_labels: int = 10
-    train_homogeneity: float = 1.0
     learning_rate: float = 5e-4
     weight_decay: float = 0.01
     batch_size: int = 64
@@ -52,6 +51,8 @@ class TrainConfig:
     output_dir: Path = Path("outputs/vit_cifar10")
     use_pretrained: bool = True
 
+    homogeneity: float = 1.0
+    num_clients: int = 1
 
 class MetricRecord(TypedDict):
     epoch: int
@@ -137,7 +138,8 @@ def main():
     parser.add_argument('-tc', '--use-torch-compile', action='store_true')
     parser.add_argument('-o', '--output-dir', type=Path, default=Path("outputs/vit_cifar10"))
     parser.add_argument('-pre', '--use-pretrained', action='store_true')
-    parser.add_argument('-alpha', '--train-homogeneity', type=float, default=1.0)
+    parser.add_argument('-alpha', '--homogeneity', type=float, default=1.0)
+    parser.add_argument('-c', '--num-clients', type=int, default=1)
     args = parser.parse_args()
     cfg = TrainConfig(**vars(args))
     logger.info(pformat(cfg))
@@ -177,9 +179,10 @@ def main():
         # model = torch.compile(model)
         model.compile()
 
-    train_batches, eval_batches = build_dataloaders(
+    clients_train_batches, eval_batches = build_dataloaders(
         train_ds=train_ds,
-        train_homogeneity=cfg.train_homogeneity,
+        homogeneity=cfg.homogeneity,
+        num_clients=cfg.num_clients,
         eval_ds=eval_ds,
         image_processor=image_processor,
         batch_size=cfg.batch_size,
@@ -187,6 +190,7 @@ def main():
         prefetch_factor=cfg.prefetch_factor,
         device=device,
     )
+    train_batches = clients_train_batches[0]
 
     metrics_train = train(model, train_batches, device, cfg)
     metrics = defaultdict(dict)

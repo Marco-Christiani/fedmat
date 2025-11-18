@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from datasets import Dataset, load_dataset
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader, Sampler, RandomSampler
 from torch.distributions import Dirichlet, Categorical, Uniform
 
 if TYPE_CHECKING:
@@ -38,14 +38,15 @@ def load_cifar10_subsets(
 
 def build_dataloaders(
     train_ds: Dataset,
-    train_homogeneity: float,
+    homogeneity: float,
+    num_clients: int,
     eval_ds: Dataset,
     image_processor: AutoImageProcessor,
     batch_size: int,
     num_workers: int,
     prefetch_factor: int,
     device: torch.device,
-) -> tuple[Iterable[dict[str, Tensor]], Iterable[dict[str, Tensor]]]:
+) -> tuple[List[Iterable[dict[str, Tensor]]], Iterable[dict[str, Tensor]]]:
     """Create DataLoaders and wrap them with CUDA prefetching when applicable. """
 
     collate_fn = Collator(image_processor)
@@ -62,21 +63,21 @@ def build_dataloaders(
     if num_workers > 0:
         common_kwargs["prefetch_factor"] = prefetch_factor
 
-    train_loader = DataLoader(
+    train_loaders = [DataLoader(
         train_ds,
-        shuffle=True,
-        sampler=DirichletSampler(
-            partition_labels_by_indices(train_ds[i]["label"] for i in range(len(train_ds))),
-            train_homogeneity
-        ),
+        sampler=sampler,
         **common_kwargs,
-    )
+    ) for sampler in partition_by_client(
+        (train_ds[i]["label"] for i in range(len(train_ds))),
+        num_clients,
+        homogeneity,
+    )]
     eval_loader = DataLoader(
         eval_ds,
         shuffle=False,
         **common_kwargs,
     )
-    return train_loader, eval_loader
+    return train_loaders, eval_loader
 
 class Collator:
     def __init__(
@@ -98,7 +99,18 @@ class Collator:
             "labels": labels,
         }
 
-def partition_labels_by_indices(labels: Iterator[int]) -> List[List[int]]:
+def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 1.0) -> List[Sampler]:
+    class_indices = partition_by_labels(labels)
+    dirichlet = Dirichlet(alpha * torch.ones(num_clients) / num_clients)
+    client_indices = [list() for _ in range(num_clients)]
+    for indices in class_indices:
+        categorical = Categorical(dirichlet.sample())
+        assignments = categorical.sample((len(indices),))
+        for i, assignments in enumerate(assignments):
+            client_indices[assignments].append(i)
+    return [RandomSampler(indices) for indices in client_indices]
+
+def partition_by_labels(labels: Iterator[int]) -> List[List[int]]:
     class_indices = defaultdict(list)
     num_classes = 0
     for i, class_ in enumerate(labels):
@@ -112,21 +124,24 @@ class DirichletSampler(Sampler):
         super().__init__()
 
         num_classes = len(class_indices)
-        class_sizes = torch.astensor([len(indices) for indices in class_indices])
+        class_sizes = torch.as_tensor([len(indices) for indices in class_indices])
         dataset_size = torch.sum(class_sizes)
         concentration = class_sizes / dataset_size
-        dirichlet = Dirichlet(alpha * concentration);
+        dirichlet = Dirichlet(alpha * concentration)
 
         self.class_indices = [
             torch.as_tensor(class_indices[i])[torch.randperm(class_sizes[i])]
             for i in range(num_classes)
         ]
+        self.class_sizes = class_sizes
+        self.dataset_size = dataset_size
         self.categorical = Categorical(dirichlet.sample())
-        self.class_samplers = [Uniform(0, size) for size in class_sizes]
 
     def __iter__(self) -> Iterator[int]:
-        while True:
+        class_indices = [indices[torch.randperm(len(indices))].tolist() for indices in self.class_indices]
+        for _ in range(len(self)):
             class_ = self.categorical.sample()
-            indices = self.class_indices[class_]
-            sampler = self.class_samplers[class_]
-            yield indices[sampler.sample()]
+            yield class_indices[class_].pop()
+
+    def __len__(self) -> int:
+        return torch.min(self.class_sizes)
