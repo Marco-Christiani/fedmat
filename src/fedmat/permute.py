@@ -1,38 +1,71 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
-from torch import Tensor, nn
+from torch import Tensor
 
-
-def permute_heads(
-    qkv: Tensor,
-    perm: Tensor,
-    n_head: int,
-    d_head: int,
-    out: Tensor | None = None
-):
-    D = n_head * d_head
-    qkv = qkv.view(D, 3, n_head, d_head)  # [H*hd, 3*H*hd] to [D, 3, H, hd]
-    qkv = qkv[:, :, perm, :]     # permute
-    qkv = qkv.view(D, 3 * D)     # [H*hd, 3*H*hd]
-    if out:
-        out.data.copy_(qkv)
-        return out
-    return qkv
+if TYPE_CHECKING:
+    from transformers.models.vit.modeling_vit import ViTLayer, ViTSelfAttention, ViTSelfOutput
 
 
 @torch.inference_mode()
-def permute_mha_block(
-    layer: nn.Module,
-    perm: torch.Tensor
-):
-    mha = layer.mha
-    assert isinstance(mha, nn.Module)
-    H = mha.num_heads
-    assert isinstance(H, int)
-    hd = mha.head_dim
-    assert isinstance(hd, int)
-    # D = H * hd
-    qkv = mha.qkv.data
-    assert isinstance(qkv, Tensor)
-    permute_heads(qkv=qkv, perm=perm, n_head=H, d_head=hd)
+def permute_self_attention_heads(attn: ViTSelfAttention, perm: Tensor) -> None:
+    """
+    Attn is a ViTSelfAttention module:
+        attn.query, attn.key, attn.value : Linear
+    """
+    n_head = attn.num_attention_heads
+    d_head = attn.attention_head_size
+    d_embed = n_head * d_head
+
+    for proj in (attn.query, attn.key, attn.value):
+        W = proj.weight.data        # [D, D]
+        b = proj.bias.data          # [D]
+
+        # Permute output heads
+        W4 = W.view(n_head, d_head, d_embed)
+        W4 = W4[perm]
+        proj.weight.data.copy_(W4.view(d_embed, d_embed))
+
+        # Permute bias
+        b4 = b.view(n_head, d_head)
+        b4 = b4[perm]
+        proj.bias.data.copy_(b4.view(d_embed))
+
+
+@torch.inference_mode()
+def permute_output_projection(
+    attn_output: ViTSelfOutput,
+    perm: Tensor,
+    n_head: int,
+    d_head: int
+) -> None:
+    dense = attn_output.dense
+    W = dense.weight.data  # [D, D]
+    d_embed = n_head * d_head
+
+    W3 = W.view(d_embed, n_head, d_head)  # [D_out, H, hd]
+    W3 = W3[:, perm, :]
+    dense.weight.data.copy_(W3.view(d_embed, d_embed))
+    # do nothing to bias
+
+
+@torch.inference_mode()
+def permute_vit_layer_heads(layer: ViTLayer, perm: Tensor) -> None:
+    """Permute heads of MHA block.
+
+    layer: a HF ViTLayer
+    perm: Tensor of shape [H]
+
+    Example:
+    >>> for layer in model.vit.encoder.layer:
+    >>>     permute_vit_layer_heads(layer, perm)
+    """
+    sa = layer.attention.attention     # ViTSelfAttention
+    so = layer.attention.output        # ViTSelfOutput
+
+    n_head = sa.num_attention_heads
+    hd = sa.attention_head_size
+    permute_self_attention_heads(sa, perm)
+    permute_output_projection(so, perm, n_head=n_head, d_head=hd)
