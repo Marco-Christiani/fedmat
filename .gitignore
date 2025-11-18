@@ -208,3 +208,9 @@ marimo/_lsp/
 __marimo__/
 data
 *.pt[h]
+
+# MacOS madness
+.DS_Store
+
+# Run artifacts
+/output/
