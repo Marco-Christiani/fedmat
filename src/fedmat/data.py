@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 import torch
 from datasets import Dataset, load_dataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
+from torch.distributions import Dirichlet, Categorical, Uniform
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-    from typing import Any
+    from collections.abc import Iterable, Iterator
+    from typing import Any, Dict
 
     from torch import Tensor
     from transformers import AutoImageProcessor
@@ -36,6 +38,7 @@ def load_cifar10_subsets(
 
 def build_dataloaders(
     train_ds: Dataset,
+    train_homogeneity: float,
     eval_ds: Dataset,
     image_processor: AutoImageProcessor,
     batch_size: int,
@@ -62,6 +65,10 @@ def build_dataloaders(
     train_loader = DataLoader(
         train_ds,
         shuffle=True,
+        sampler=DirichletSampler(
+            partition_labels_by_indices(train_ds[i]["label"] for i in range(len(train_ds))),
+            train_homogeneity
+        ),
         **common_kwargs,
     )
     eval_loader = DataLoader(
@@ -90,3 +97,36 @@ class Collator:
             "pixel_values": encodings["pixel_values"],
             "labels": labels,
         }
+
+def partition_labels_by_indices(labels: Iterator[int]) -> List[List[int]]:
+    class_indices = defaultdict(list)
+    num_classes = 0
+    for i, class_ in enumerate(labels):
+        class_indices[class_].append(i)
+        num_classes = max(num_classes, class_ + 1)
+    class_indices = [class_indices[i] for i in range(num_classes)]
+    return class_indices
+
+class DirichletSampler(Sampler):
+    def __init__(self, class_indices: List[List[int]], alpha: float = 0.0):
+        super().__init__()
+
+        num_classes = len(class_indices)
+        class_sizes = torch.astensor([len(indices) for indices in class_indices])
+        dataset_size = torch.sum(class_sizes)
+        concentration = class_sizes / dataset_size
+        dirichlet = Dirichlet(alpha * concentration);
+
+        self.class_indices = [
+            torch.as_tensor(class_indices[i])[torch.randperm(class_sizes[i])]
+            for i in range(num_classes)
+        ]
+        self.categorical = Categorical(dirichlet.sample())
+        self.class_samplers = [Uniform(0, size) for size in class_sizes]
+
+    def __iter__(self) -> Iterator[int]:
+        while True:
+            class_ = self.categorical.sample()
+            indices = self.class_indices[class_]
+            sampler = self.class_samplers[class_]
+            yield indices[sampler.sample()]
