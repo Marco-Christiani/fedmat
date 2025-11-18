@@ -265,7 +265,7 @@ def main():
     if cfg.use_torch_compile:
         model.compile()
 
-    clients_train_batches, eval_batches = build_dataloaders(
+    client_dataloaders, eval_dataloader = build_dataloaders(
         train_ds=train_ds,
         homogeneity=cfg.homogeneity,
         num_clients=cfg.num_clients,
@@ -276,20 +276,19 @@ def main():
         prefetch_factor=cfg.prefetch_factor,
         device=device,
     )
-    train_batches = clients_train_batches[0]
+    train_dataloader = client_dataloaders[0]
 
     # Train
-    metrics_train = train(model, train_batches, device, cfg)
+    metrics_train = train(model, train_dataloader, device, cfg)
     metrics = defaultdict(dict)
     metrics["train"] = utils.aos_to_soa(metrics_train)
 
     # Eval
-    accuracy, confmat = evaluate(model, eval_batches, device, enable_bf16=cfg.use_bf16)
+    accuracy, confmat = evaluate(model, eval_dataloader, device, enable_bf16=cfg.use_bf16)
     metrics["eval"]["accuracy"] = accuracy
 
     # Save
     now = datetime.now().isoformat()
-    logger.info(f"metrics:\n {metrics!s}")
 
     fpath = cfg.output_dir.joinpath(f"metrics-{now}.json")
     logger.info(f"Saving metrics: {fpath!s}")
