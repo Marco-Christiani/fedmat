@@ -136,6 +136,7 @@ def main():
     parser.add_argument('-tc', '--use-torch-compile', action='store_true')
     parser.add_argument('-o', '--output-dir', type=Path, default=Path("outputs/vit_cifar10"))
     parser.add_argument('-pre', '--use-pretrained', action='store_true')
+    parser.add_argument('-alpha', '--train-homogeneity', type=float, default=1.0)
     args = parser.parse_args()
     cfg = TrainConfig(**vars(args))
     logger.info(pformat(cfg))
@@ -177,6 +178,7 @@ def main():
 
     train_batches, eval_batches = build_dataloaders(
         train_ds=train_ds,
+        train_homogeneity=cfg.train_homogeneity,
         eval_ds=eval_ds,
         image_processor=image_processor,
         batch_size=cfg.batch_size,
