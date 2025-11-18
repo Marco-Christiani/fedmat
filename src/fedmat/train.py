@@ -146,9 +146,9 @@ def train_epoch(
                     "loss": float("nan"),  # placeholder
                 })
 
+                running_loss_gpu += loss.detach()
                 if training_metadata.global_step % cfg.log_every_n_steps == 0\
                         or step == len(dataloader) - 1:
-                    running_loss_gpu += loss.detach()
                     avg_loss_gpu = running_loss_gpu / steps_since_log
                     avg_loss = float(avg_loss_gpu.item())
                     progress.set_postfix(loss=f"{avg_loss:.4f}")
