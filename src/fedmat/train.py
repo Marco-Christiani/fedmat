@@ -32,6 +32,7 @@ class TrainConfig:
 
     model_name: str = "google/vit-base-patch16-224-in21k"
     num_labels: int = 10
+    train_homogeneity: float = 1.0
     learning_rate: float = 5e-4
     weight_decay: float = 0.01
     batch_size: int = 64
