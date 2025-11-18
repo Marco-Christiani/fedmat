@@ -22,6 +22,8 @@ from .evaluate import evaluate
 from .utils import default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
+    from typing import Tuple
+
     from torch import Tensor
     from torch.utils.data import DataLoader
 
@@ -70,12 +72,15 @@ class MetricRecord(TypedDict):
 Metrics = list[MetricRecord]
 
 
-def train(
+def train_epoch(
     model: ViTForImageClassification,
     dataloader: DataLoader[Batch],
     device: torch.device,
     cfg: TrainConfig,
-) -> Metrics:
+    best_loss: float = float("inf"),
+    epoch_metadata: dict = dict(),
+    epoch_name: str = "",
+) -> Tuple[Metrics,float]:
     model.train()
 
     optimizer = torch.optim.AdamW(
@@ -97,101 +102,112 @@ def train(
 
     metrics_meta: list[MetricRecord] = []  # cpu
 
-    global_step = 0
-
-    best_loss: float = float("inf")
-
     try:
-        for epoch in range(cfg.epochs):
-            running_loss_gpu: Tensor = torch.zeros((), device=device)
-            steps_since_log = 0
+        running_loss_gpu: Tensor = torch.zeros((), device=device)
+        steps_since_log = 0
 
-            progress = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{cfg.epochs}")
+        progress = tqdm(dataloader, desc=epoch_name)
 
-            for step, batch in enumerate(progress):
-                global_step += 1
-                steps_since_log += 1
+        for step, batch in enumerate(progress):
+            steps_since_log += 1
 
-                pixel_values = batch["pixel_values"].to(device)
-                labels = batch["labels"].to(device)
+            pixel_values = batch["pixel_values"].to(device)
+            labels = batch["labels"].to(device)
 
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=amp_dtype,
-                    enabled=use_autocast,
-                ):
-                    outputs = model(
-                        pixel_values=pixel_values,  # (B, C, H, W)
-                        labels=labels,  # (B,)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=use_autocast,
+            ):
+                outputs = model(
+                    pixel_values=pixel_values,  # (B, C, H, W)
+                    labels=labels,  # (B,)
+                )
+                loss = outputs.loss
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+
+            if cfg.max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+
+            optimizer.step()
+
+            metrics_loss_gpu[step] = loss.detach()
+            metrics_meta.append({
+                **epoch_metadata,
+                "step": step,
+                "loss": float("nan"),  # placeholder
+            })
+
+            if step % cfg.log_every_n_steps == 0 or step == len(dataloader) - 1:
+                running_loss_gpu += loss.detach()
+                avg_loss_gpu = running_loss_gpu / steps_since_log
+                avg_loss = float(avg_loss_gpu.item())
+                progress.set_postfix(loss=f"{avg_loss:.4f}")
+                if cfg.use_wandb:
+                    wandb.log(
+                        {
+                            **epoch_metadata,
+                            "train/loss": avg_loss,
+                            "train/best_loss": best_loss,
+                            "train/step": step,
+                            "train/lr": optimizer.param_groups[0]["lr"],
+                        },
+                        step=step,
                     )
-                    loss = outputs.loss
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-
-                if cfg.max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-
-                optimizer.step()
-
-                metrics_loss_gpu[global_step - 1] = loss.detach()
-                metrics_meta.append({
-                    "epoch": epoch,
-                    "step": step,
-                    "global_step": global_step,
-                    "loss": float("nan"),  # placeholder
-                })
-
-                if global_step % cfg.log_every_n_steps == 0:
-                    running_loss_gpu += loss.detach()
-                    avg_loss_gpu = running_loss_gpu / steps_since_log
-                    avg_loss = float(avg_loss_gpu.item())
-                    progress.set_postfix(loss=f"{avg_loss:.4f}")
+                if avg_loss < best_loss:  # new best
+                    best_loss = avg_loss
+                    ckpt_path = cfg.output_dir / "best.pt"
+                    torch.save(
+                        {
+                            **epoch_metadata,
+                            "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "step": step,
+                        },
+                        ckpt_path,
+                    )
                     if cfg.use_wandb:
-                        wandb.log(
-                            {
-                                "train/loss": avg_loss,
-                                "train/epoch": epoch,
-                                "train/step": step,
-                                "train/global_step": global_step,
-                                "train/lr": optimizer.param_groups[0]["lr"],
-                            },
-                            step=global_step,
-                        )
+                        artifact = wandb.Artifact("best-model", type="model")
+                        artifact.add_file(ckpt_path)
+                        wandb.log_artifact(artifact)
 
-                    if avg_loss < best_loss:  # new best
-                        best_loss = avg_loss
-                        ckpt_path = cfg.output_dir / "best.pt"
-                        torch.save(
-                            {
-                                "model": model.state_dict(),
-                                "optimizer": optimizer.state_dict(),
-                                "epoch": epoch,
-                                "global_step": global_step,
-                            },
-                            ckpt_path,
-                        )
-                        if cfg.use_wandb:
-                            artifact = wandb.Artifact("best-model", type="model")
-                            artifact.add_file(ckpt_path)
-                            wandb.log_artifact(artifact)
-
-                    # reset local running stats
-                    running_loss_gpu.zero_()
-                    steps_since_log = 0
+                # reset local running stats
+                running_loss_gpu.zero_()
+                steps_since_log = 0
 
     finally:
         # sync and fill
         loss_list_cpu = metrics_loss_gpu.cpu().tolist()
         for rec in metrics_meta:
-            rec["loss"] = loss_list_cpu[rec["global_step"] - 1]
+            rec["loss"] = loss_list_cpu[rec["step"]]
 
-        if cfg.use_wandb:
-            wandb.summary["final/loss"] = loss_list_cpu[-1]
-            wandb.summary["best/loss"] = best_loss
+    return metrics_meta, best_loss
 
-    return metrics_meta
+def train(
+    model: ViTForImageClassification,
+    dataloader: DataLoader[Batch],
+    device: torch.device,
+    cfg: TrainConfig,
+) -> Metrics:
+    epochs_name_pad = len(str(cfg.epochs))
+    metrics = []
+    best_loss = float("inf")
+    for epoch in range(cfg.epochs):
+        epoch_padded = (" " * epoch_padded) + str(epoch)
+        epoch_metrics, best_loss = train_epoch(
+            model, dataloader, device, cfg,
+            best_loss = best_loss,
+            epoch_metadata=dict(epoch=epoch),
+            epoch_name=f"Epoch {epoch_name}/{cfg.epochs}"
+        )
+        metrics.extend(epoch_metrics)
 
+    if cfg.use_wandb:
+        wandb.summary["final/loss"] = metrics[-1]["loss"]
+        wandb.summary["best/loss"] = best_loss
 
 def main():
     """Vanilla train ViT on CIFAR-10."""
