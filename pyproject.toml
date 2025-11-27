@@ -102,11 +102,9 @@ select = [
 ignore = [
   "ANN002", # missing args type annotation (https://docs.astral.sh/ruff/rules/missing-type-args/)
   "ANN003", # missing kwargs type annotation (https://docs.astral.sh/ruff/rules/missing-type-kwargs/#missing-type-kwargs-ann003)
-  "ANN101", # Missing type annotation for `self` in method
   "ANN401", # more specific arg typing than Any (https://docs.astral.sh/ruff/rules/any-type/)
   "D204", # https://docs.astral.sh/ruff/rules/one-blank-line-after-class/
   "E402",   # imports at top of file (https://docs.astral.sh/ruff/rules/module-import-not-at-top-of-file/)
-  "PD901",  # Avoid using the generic variable name `df` for DataFrames []
   "TRY003" # Avoid specifying long messages outside the exception class
 ]
 

@@ -1,8 +1,9 @@
-import math
 import copy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 class MHA(nn.Module):
     def __init__(self, num_heads, head_dim, embed_dim=None, causal=False):
@@ -33,6 +34,7 @@ class MHA(nn.Module):
 
         return out
 
+
 class MLP(nn.Module):
     def __init__(self, intermediate_dim, hidden_dim):
         super().__init__()
@@ -41,6 +43,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.fc2(F.relu(self.fc1(x)))
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, num_heads, head_dim, mlp_hidden_dim, embed_dim=None, causal=False):
@@ -56,13 +59,12 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.ln2(x))
         return x
 
+
 class Transformer(nn.Module):
     def __init__(self, num_layers=2, num_heads=4, d_model=16):
         super().__init__()
         self.layers = nn.ModuleList([
-            TransformerBlock(num_heads, d_model // num_heads,
-                             mlp_hidden_dim=4 * d_model,
-                             embed_dim=d_model)
+            TransformerBlock(num_heads, d_model // num_heads, mlp_hidden_dim=4 * d_model, embed_dim=d_model)
             for _ in range(num_layers)
         ])
         self.out = nn.Linear(d_model, d_model)
@@ -72,6 +74,7 @@ class Transformer(nn.Module):
             x = layer(x)
         x = self.out(x)
         return x
+
 
 def permute_heads_layer(layer: TransformerBlock, perm: torch.Tensor):
     mha = layer.mha
@@ -93,11 +96,13 @@ def permute_heads_layer(layer: TransformerBlock, perm: torch.Tensor):
         W = W.contiguous().view(out_features, H * hd)
         mha.o_proj.weight.data.copy_(W)
 
+
 def apply_random_permutation_to_model_heads(model: Transformer, p=1.0):
     for layer in model.layers:
         if torch.rand(()) < p:
             perm = torch.randperm(layer.mha.num_heads)
             permute_heads_layer(layer, perm)
+
 
 def model_param_distance(m1: nn.Module, m2: nn.Module):
     s1 = m1.state_dict()
@@ -105,7 +110,8 @@ def model_param_distance(m1: nn.Module, m2: nn.Module):
     sq_sum = 0.0
     for k in s1.keys():
         sq_sum += (s1[k] - s2[k]).pow(2).sum().item()
-    return sq_sum ** 0.5
+    return sq_sum**0.5
+
 
 def average_models(models):
     base = copy.deepcopy(models[0])
@@ -117,6 +123,7 @@ def average_models(models):
 
     base.load_state_dict(avg_state)
     return base
+
 
 def flatten_heads_for_matching(layer: TransformerBlock) -> torch.Tensor:
     mha = layer.mha
@@ -134,6 +141,7 @@ def flatten_heads_for_matching(layer: TransformerBlock) -> torch.Tensor:
     W_heads = W.permute(1, 0, 2).contiguous().view(H, -1)
 
     return torch.cat([qkv_heads, W_heads], dim=1)
+
 
 def align_client_to_ref(client: Transformer, ref: Transformer):
     for ref_layer, cli_layer in zip(ref.layers, client.layers):
@@ -156,12 +164,14 @@ def align_client_to_ref(client: Transformer, ref: Transformer):
 
     return client
 
+
 def align_all_clients_to_first(clients):
     ref = clients[0]
     aligned = [copy.deepcopy(ref)]
     for c in clients[1:]:
         aligned.append(align_client_to_ref(copy.deepcopy(c), ref))
     return aligned
+
 
 def make_clients_from_global(global_model, num_clients=5, noise_std=0.05, perm_prob=0.5):
     clients = []
@@ -174,6 +184,7 @@ def make_clients_from_global(global_model, num_clients=5, noise_std=0.05, perm_p
         clients.append(c)
     return clients
 
+
 def main():
     num_layers = 3
     num_heads = 4
@@ -181,7 +192,7 @@ def main():
     num_clients = 8
 
     global_model = Transformer(num_layers=num_layers, num_heads=num_heads, d_model=d_model)
-    
+
     clients = make_clients_from_global(
         global_model,
         num_clients=num_clients,
@@ -213,6 +224,7 @@ def main():
     print("\nOutput MSE vs original global model on random data:")
     print(f" - Naive FedAvg:        {mse_naive:.6f}")
     print(f" - Head-aligned FedAvg: {mse_aligned:.6f}")
+
 
 if __name__ == "__main__":
     main()

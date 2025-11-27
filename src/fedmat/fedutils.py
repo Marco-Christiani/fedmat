@@ -1,10 +1,9 @@
+from collections.abc import Callable
 from copy import deepcopy
+from typing import List
 
 import torch
-from torch import Tensor
-from torch import nn
-from typing import List
-from collections.abc import Callable
+from torch import Tensor, nn
 
 ReduceFn = Callable[[List[Tensor]], Tensor]
 

@@ -20,8 +20,8 @@ def permute_self_attention_heads(attn: ViTSelfAttention, perm: Tensor) -> None:
     d_embed = n_head * d_head
 
     for proj in (attn.query, attn.key, attn.value):
-        W = proj.weight.data        # [D, D]
-        b = proj.bias.data          # [D]
+        W = proj.weight.data  # [D, D]
+        b = proj.bias.data  # [D]
 
         # Permute output heads
         W4 = W.view(n_head, d_head, d_embed)
@@ -35,12 +35,7 @@ def permute_self_attention_heads(attn: ViTSelfAttention, perm: Tensor) -> None:
 
 
 @torch.inference_mode()
-def permute_output_projection(
-    attn_output: ViTSelfOutput,
-    perm: Tensor,
-    n_head: int,
-    d_head: int
-) -> None:
+def permute_output_projection(attn_output: ViTSelfOutput, perm: Tensor, n_head: int, d_head: int) -> None:
     dense = attn_output.dense
     W = dense.weight.data  # [D, D]
     d_embed = n_head * d_head
@@ -62,8 +57,8 @@ def permute_vit_layer_heads(layer: ViTLayer, perm: Tensor) -> None:
     >>> for layer in model.vit.encoder.layer:
     >>>     permute_vit_layer_heads(layer, perm)
     """
-    sa = layer.attention.attention     # ViTSelfAttention
-    so = layer.attention.output        # ViTSelfOutput
+    sa = layer.attention.attention  # ViTSelfAttention
+    so = layer.attention.output  # ViTSelfOutput
 
     n_head = sa.num_attention_heads
     hd = sa.attention_head_size
