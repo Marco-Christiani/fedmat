@@ -1,3 +1,5 @@
+"""Data loading and partitioning utilities for federated learning."""
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -88,13 +90,34 @@ def build_dataloaders(
 
 
 class Collator:
+    """Image batch collator for processing images with a given processor."""
+
     def __init__(
         self,
         image_processor: AutoImageProcessor,
-    ):  # -> Callable[[list[dict[str, Any]]], dict[str, torch.Tensor]]:
+    ) -> None:
+        """Initialize the collator with an image processor.
+
+        Parameters
+        ----------
+        image_processor : AutoImageProcessor
+            Processor to apply to images (e.g., from transformers)
+        """
         self.image_processor = image_processor
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        """Process a batch of examples.
+
+        Parameters
+        ----------
+        batch : list[dict[str, Any]]
+            List of examples, each with 'img' and 'label' keys
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary with 'pixel_values' and 'labels' tensors
+        """
         images = [example["img"] for example in batch]
         labels_list = [int(example["label"]) for example in batch]
 
@@ -109,9 +132,25 @@ class Collator:
 
 
 def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 1.0) -> list[Sampler]:
+    """Partition dataset labels among clients using Dirichlet distribution.
+
+    Parameters
+    ----------
+    labels : Iterator[int]
+        Iterator of class labels
+    num_clients : int
+        Number of clients to partition data among
+    alpha : float, optional
+        Concentration parameter for Dirichlet distribution, by default 1.0
+
+    Returns
+    -------
+    list[Sampler]
+        List of samplers, one for each client
+    """
     class_indices = partition_by_labels(labels)
     dirichlet = Dirichlet(alpha * torch.ones(num_clients) / num_clients)
-    client_indices = [list() for _ in range(num_clients)]
+    client_indices = [[] for _ in range(num_clients)]
     for indices in class_indices:
         categorical = Categorical(dirichlet.sample())
         assignments = categorical.sample((len(indices),))
@@ -121,6 +160,18 @@ def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 
 
 
 def partition_by_labels(labels: Iterator[int]) -> list[list[int]]:
+    """Group data indices by their class labels.
+
+    Parameters
+    ----------
+    labels : Iterator[int]
+        Iterator of class labels
+
+    Returns
+    -------
+    list[list[int]]
+        List of lists, where each inner list contains indices for a class
+    """
     class_indices = defaultdict(list)
     num_classes = 0
     for i, class_ in enumerate(labels):
@@ -131,7 +182,18 @@ def partition_by_labels(labels: Iterator[int]) -> list[list[int]]:
 
 
 class DirichletSampler(Sampler):
-    def __init__(self, class_indices: list[list[int]], alpha: float = 0.0):
+    """Sampler that uses Dirichlet distribution for class-balanced sampling."""
+
+    def __init__(self, class_indices: list[list[int]], alpha: float = 0.0) -> None:
+        """Initialize the sampler with class indices and concentration parameter.
+
+        Parameters
+        ----------
+        class_indices : list[list[int]]
+            List of indices grouped by class
+        alpha : float, optional
+            Concentration parameter for Dirichlet distribution, by default 0.0
+        """
         super().__init__()
 
         num_classes = len(class_indices)
@@ -148,10 +210,12 @@ class DirichletSampler(Sampler):
         self.categorical = Categorical(dirichlet.sample())
 
     def __iter__(self) -> Iterator[int]:
+        """Iterate over shuffled indices sampled from classes via Dirichlet distribution."""
         class_indices = [indices[torch.randperm(len(indices))].tolist() for indices in self.class_indices]
         for _ in range(len(self)):
             class_ = self.categorical.sample()
             yield class_indices[class_].pop()
 
     def __len__(self) -> int:
+        """Return the minimum class size to ensure balanced sampling."""
         return torch.min(self.class_sizes)

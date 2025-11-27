@@ -1,3 +1,5 @@
+"""Evaluation utilities for model assessment."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -21,6 +23,24 @@ def evaluate(
     device: torch.device,
     enable_bf16: bool,
 ) -> tuple[float, torch.Tensor]:
+    """Evaluate model on a dataset and return accuracy and confusion matrix.
+
+    Parameters
+    ----------
+    model : ViTForImageClassification
+        Vision Transformer model to evaluate
+    dataloader : DataLoader[Batch]
+        DataLoader providing batches of data
+    device : torch.device
+        Device to run evaluation on
+    enable_bf16 : bool
+        Whether to use bfloat16 precision
+
+    Returns
+    -------
+    tuple[float, torch.Tensor]
+        Tuple of (accuracy, confusion_matrix)
+    """
     _ = model.eval()
     use_autocast, amp_dtype = get_amp_settings(device, enable_bf16)
 

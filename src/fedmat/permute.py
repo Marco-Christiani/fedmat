@@ -1,3 +1,5 @@
+"""Head permutation utilities for Vision Transformer models."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -11,9 +13,14 @@ if TYPE_CHECKING:
 
 @torch.inference_mode()
 def permute_self_attention_heads(attn: ViTSelfAttention, perm: Tensor) -> None:
-    """
-    Attn is a ViTSelfAttention module:
-        attn.query, attn.key, attn.value : Linear
+    """Permute attention heads in query, key, value projections.
+
+    Parameters
+    ----------
+    attn : ViTSelfAttention
+        Vision Transformer self-attention module
+    perm : Tensor
+        Head permutation indices
     """
     n_head = attn.num_attention_heads
     d_head = attn.attention_head_size
@@ -36,6 +43,19 @@ def permute_self_attention_heads(attn: ViTSelfAttention, perm: Tensor) -> None:
 
 @torch.inference_mode()
 def permute_output_projection(attn_output: ViTSelfOutput, perm: Tensor, n_head: int, d_head: int) -> None:
+    """Permute attention heads in output projection.
+
+    Parameters
+    ----------
+    attn_output : ViTSelfOutput
+        Attention output module
+    perm : Tensor
+        Head permutation indices
+    n_head : int
+        Number of attention heads
+    d_head : int
+        Head dimension
+    """
     dense = attn_output.dense
     W = dense.weight.data  # [D, D]
     d_embed = n_head * d_head
@@ -48,14 +68,19 @@ def permute_output_projection(attn_output: ViTSelfOutput, perm: Tensor, n_head: 
 
 @torch.inference_mode()
 def permute_vit_layer_heads(layer: ViTLayer, perm: Tensor) -> None:
-    """Permute heads of MHA block.
+    """Permute attention heads in a Vision Transformer layer.
 
-    layer: a HF ViTLayer
-    perm: Tensor of shape [H]
+    Parameters
+    ----------
+    layer : ViTLayer
+        A Hugging Face ViTLayer module
+    perm : Tensor
+        Permutation indices of shape [H]
 
-    Example:
+    Examples
+    --------
     >>> for layer in model.vit.encoder.layer:
-    >>>     permute_vit_layer_heads(layer, perm)
+    ...     permute_vit_layer_heads(layer, perm)
     """
     sa = layer.attention.attention  # ViTSelfAttention
     so = layer.attention.output  # ViTSelfOutput

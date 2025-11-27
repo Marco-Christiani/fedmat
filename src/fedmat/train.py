@@ -1,3 +1,5 @@
+"""Training utilities for vision transformer models on federated data."""
+
 from __future__ import annotations
 
 import json
@@ -60,6 +62,8 @@ class TrainConfig:
 
 
 class MetricRecord(TypedDict):
+    """Metric record for a training step."""
+
     epoch: int
     global_step: int
     step: int
@@ -86,6 +90,30 @@ def train_epoch(
     epoch_metadata: dict | None = None,
     epoch_name: str = "",
 ) -> tuple[Metrics, float]:
+    """Train model for one epoch.
+
+    Parameters
+    ----------
+    model : ViTForImageClassification
+        Vision Transformer model to train
+    dataloader : DataLoader[Batch]
+        Training data loader
+    device : torch.device
+        Device to train on
+    cfg : TrainConfig
+        Training configuration
+    training_metadata : TrainingMetadata
+        Metadata tracked across epochs
+    epoch_metadata : dict | None, optional
+        Metadata for this epoch, by default None
+    epoch_name : str, optional
+        Name for progress bar, by default ""
+
+    Returns
+    -------
+    tuple[Metrics, float]
+        Tuple of (metrics_list, final_loss)
+    """
     if epoch_metadata is None:
         epoch_metadata = {}
     model.train()
@@ -202,6 +230,24 @@ def train(
     device: torch.device,
     cfg: TrainConfig,
 ) -> Metrics:
+    """Train model for multiple epochs.
+
+    Parameters
+    ----------
+    model : ViTForImageClassification
+        Vision Transformer model to train
+    dataloader : DataLoader[Batch]
+        Training data loader
+    device : torch.device
+        Device to train on
+    cfg : TrainConfig
+        Training configuration
+
+    Returns
+    -------
+    Metrics
+        List of metric records for all training steps
+    """
     epoch_name_padding = " " * len(str(cfg.epochs))
     metrics = []
     training_metadata = TrainingMetadata()
@@ -223,7 +269,7 @@ def train(
         wandb.summary["best/loss"] = training_metadata.best_loss
 
 
-def main():
+def main() -> None:
     """Vanilla train ViT on CIFAR-10."""
     parser = ArgumentParser(
         prog="fedmat_train",
