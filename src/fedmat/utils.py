@@ -32,7 +32,7 @@ def get_amp_settings(
 
 def aos_to_soa(aos: Sequence[T]) -> dict[str, list[Any]]:
     """AOS to SOA.
-    
+
     Example:
         >>> aos = [{'name': 'Alice', 'age': 25}, {'name': 'Bob', 'age': 30}]
         >>> aos_to_soa(aos)
