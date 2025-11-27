@@ -1,17 +1,18 @@
+from __future__ import annotations
+
 from collections.abc import Callable
 from copy import deepcopy
-from typing import List
 
 import torch
 from torch import Tensor, nn
 
-ReduceFn = Callable[[List[Tensor]], Tensor]
+ReduceFn = Callable[[list[Tensor]], Tensor]
 
 
 def reduce(
-    inputs: List[nn.Module],
+    inputs: list[nn.Module],
     reduce_fn: ReduceFn,
-    output: Optional[nn.Module] = None,
+    output: nn.Module | None = None,
 ) -> nn.Module:
     if output is None:
         if len(inputs) == 0:

@@ -21,8 +21,6 @@ from .evaluate import evaluate
 from .utils import default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
-    from typing import Tuple
-
     from torch import Tensor
     from torch.utils.data import DataLoader
 
@@ -87,7 +85,7 @@ def train_epoch(
     training_metadata: TrainingMetadata,
     epoch_metadata: dict | None = None,
     epoch_name: str = "",
-) -> Tuple[Metrics, float]:
+) -> tuple[Metrics, float]:
     if epoch_metadata is None:
         epoch_metadata = {}
     model.train()
