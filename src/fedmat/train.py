@@ -179,6 +179,7 @@ def main():
     parser.add_argument("-alpha", "--homogeneity", type=float, default=1.0)
     parser.add_argument("-c", "--num-clients", type=int, default=1) # 1 means regular SGD, no FL
     parser.add_argument("-agg", "--aggregation", default="avg", choices = ["avg", "mat"])
+    parser.add_argument("-li", "--local-iterations", type=int, default=2)
 
     args = parser.parse_args()
     cfg = TrainConfig(**vars(args))
