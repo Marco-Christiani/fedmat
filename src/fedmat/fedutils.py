@@ -17,8 +17,9 @@ def reduce(
         if len(inputs) == 0:
             raise ValueError("reduce needs at least one input model to determine output model shape")
         output = deepcopy(inputs[0])
-    for name, parameter in output.named_parameters():
-        parameter.copy_(reduce_fn([input.get_parameter(name) for input in inputs]))
+    with torch.no_grad():
+        for name, parameter in output.named_parameters():
+            parameter.copy_(reduce_fn([input.get_parameter(name) for input in inputs]))
     return output
 
 def torch2reduce(fn: Callable[[Tensor], Tensor]) -> ReduceFn:
@@ -30,6 +31,7 @@ def replicate(
         ) -> List[nn.Module]:
     if isinstance(outputs, int):
         return [deepcopy(input) for _ in range(outputs)] 
-    for name, parameter in input.named_parameters():
-        for output in outputs:
-            output.get_parameter(name).copy_(parameter)
+    with torch.no_grad():
+        for name, parameter in input.named_parameters():
+            for output in outputs:
+                output.get_parameter(name).copy_(parameter)
