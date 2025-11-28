@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from pprint import pformat
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, TypedDict, Literal
 
 import torch
 from tqdm.auto import tqdm
@@ -20,6 +20,7 @@ from . import utils
 from .data import Batch, build_dataloaders, load_cifar10_subsets
 from .evaluate import evaluate
 from .utils import default_device, get_amp_settings, set_seed
+from .fedutils import reduce, torch2reduce, replicate
 
 if TYPE_CHECKING:
     from typing import Tuple
@@ -119,6 +120,44 @@ def train(
             epoch_name=f"Epoch {epoch_padded}/{cfg.epochs}"
         )
 
+def train_fedavg(
+    model: ViTForImageClassification,
+    dataloaders: List[DataLoader[Batch]],
+    device: torch.device,
+    cfg: TrainConfig,
+):
+    C = len(dataloaders)
+
+    client_models = None
+
+    for epoch in range(cfg.epochs): # communication rounds
+        epoch_name_padding = " " * (len(str(cfg.epochs)) - len(str(epoch)))
+        epoch_padded = epoch_name_padding + str(epoch)
+
+        client_models = replicate(model, client_models or C) # replicate server onto clients
+
+        for client_id in range(C):
+            client_name_padding = " " * (len(str(C)) - len(str(client_id)))
+            client_padded = client_name_padding + str(client_id)
+
+            client_model = client_models[client_id]
+            client_dataloader = dataloaders[client_id]
+
+            for local in range(cfg.local_iterations): # local iterations
+                local_name_padding = " " * (len(str(cfg.local_iterations)) - len(str(local)))
+                local_padded = local_name_padding + str(local)
+
+                train_epoch(
+                    client_model, client_dataloader, device, cfg,
+                    epoch_name=(
+                        f"Comm. Round {epoch_padded}/{cfg.epochs},"
+                        f"Client {client_padded}/{C},"
+                        f"Local Iter. {local_padded}/{cfg.local_iterations},"
+                        )
+                )
+
+        reduce(client_models, torch2reduce(torch.mean), model)
+
 def main():
     """Vanilla train ViT on CIFAR-10."""
     parser = ArgumentParser(
@@ -138,7 +177,8 @@ def main():
     parser.add_argument("-pre", "--use-pretrained", action="store_true")
     parser.add_argument("-rn", "--run-name", type=str, default=TrainConfig.run_name)
     parser.add_argument("-alpha", "--homogeneity", type=float, default=1.0)
-    parser.add_argument("-c", "--num-clients", type=int, default=1)
+    parser.add_argument("-c", "--num-clients", type=int, default=1) # 1 means regular SGD, no FL
+    parser.add_argument("-agg", "--aggregation", default="avg", choices = ["avg", "mat"])
 
     args = parser.parse_args()
     cfg = TrainConfig(**vars(args))
@@ -188,10 +228,14 @@ def main():
         prefetch_factor=cfg.prefetch_factor,
         device=device,
     )
-    train_dataloader = client_dataloaders[0]
 
     # Train
-    train(model, train_dataloader, device, cfg)
+    if cfg.num_clients == 1:
+        train(model, client_dataloaders[0], device, cfg)
+    elif cfg.aggregation == "avg":
+        train_fedavg(model, client_dataloaders, device, cfg)
+    elif cfg.aggregation == "mat":
+        raise NotImplementedError("fedmat aggregation is still WIP")
 
     # Eval
     accuracy, confmat = evaluate(model, eval_dataloader, device, enable_bf16=cfg.use_bf16)

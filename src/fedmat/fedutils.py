@@ -23,3 +23,13 @@ def reduce(
 
 def torch2reduce(fn: Callable[[Tensor], Tensor]) -> ReduceFn:
     return lambda tensors: fn(torch.stack(tensors), axis=0)
+
+def replicate(
+        input: nn.Module,
+        outputs: int | List[nn.Module]
+        ) -> List[nn.Module]:
+    if isinstance(outputs, int):
+        return [deepcopy(model) for _ in range(outputs)] 
+    for name, parameter in input.named_parameters():
+        for output in outputs:
+            output.get_parameter(name).copy_(parameter)
