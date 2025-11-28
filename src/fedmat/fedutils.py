@@ -3,7 +3,7 @@ from copy import deepcopy
 import torch
 from torch import Tensor
 from torch import nn
-from typing import List
+from typing import List, Optional
 from collections.abc import Callable
 
 ReduceFn = Callable[[List[Tensor]], Tensor]
