@@ -61,6 +61,8 @@ class TrainConfig:
 
     homogeneity: float = 1.0
     num_clients: int = 1
+    aggregation: Literal["avg", "mat"] = "avg"
+    local_iterations: int = 2
 
 
 def train_epoch(

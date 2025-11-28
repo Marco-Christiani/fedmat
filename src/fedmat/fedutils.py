@@ -29,7 +29,7 @@ def replicate(
         outputs: int | List[nn.Module]
         ) -> List[nn.Module]:
     if isinstance(outputs, int):
-        return [deepcopy(model) for _ in range(outputs)] 
+        return [deepcopy(input) for _ in range(outputs)] 
     for name, parameter in input.named_parameters():
         for output in outputs:
             output.get_parameter(name).copy_(parameter)
