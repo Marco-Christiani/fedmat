@@ -133,28 +133,31 @@ def train_fedavg(
     client_models = None
 
     for epoch in range(cfg.epochs): # communication rounds
-        epoch_name_padding = " " * (len(str(cfg.epochs)) - len(str(epoch)))
-        epoch_padded = epoch_name_padding + str(epoch)
+        epoch_name = str(epoch+1)
+        epoch_name_padding = " " * (len(str(cfg.epochs)) - len(epoch_name))
+        epoch_padded = epoch_name_padding + epoch_name
 
         client_models = replicate(model, client_models or C) # replicate server onto clients
 
         for client_id in range(C):
-            client_name_padding = " " * (len(str(C)) - len(str(client_id)))
-            client_padded = client_name_padding + str(client_id)
+            client_name = str(client_id+1)
+            client_name_padding = " " * (len(str(C)) - len(client_name))
+            client_padded = client_name_padding + client_name
 
             client_model = client_models[client_id]
             client_dataloader = dataloaders[client_id]
 
             for local in range(cfg.local_iterations): # local iterations
-                local_name_padding = " " * (len(str(cfg.local_iterations)) - len(str(local)))
-                local_padded = local_name_padding + str(local)
+                local_name = str(local+1)
+                local_name_padding = " " * (len(str(cfg.local_iterations)) - len(local_name))
+                local_padded = local_name_padding + local_name
 
                 train_epoch(
                     client_model, client_dataloader, device, cfg,
                     epoch_name=(
-                        f"Comm. Round {epoch_padded}/{cfg.epochs},"
-                        f"Client {client_padded}/{C},"
-                        f"Local Iter. {local_padded}/{cfg.local_iterations},"
+                        f"Comm. Round {epoch_padded}/{cfg.epochs} | "
+                        f"Client {client_padded}/{C} | "
+                        f"Local Iter. {local_padded}/{cfg.local_iterations}"
                         )
                 )
 
