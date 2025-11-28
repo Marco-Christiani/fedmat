@@ -35,3 +35,4 @@ def replicate(
         for name, parameter in input.named_parameters():
             for output in outputs:
                 output.get_parameter(name).copy_(parameter)
+    return outputs
