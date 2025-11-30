@@ -4,35 +4,28 @@ from typing import List, Tuple
 import torch
 from torch import nn, Tensor
 
+def module_names(m: nn.Module) -> List[str]:
+    return [name for name, _ in m.named_parameters()]
+
 def vectorize(m: nn.Module, names: List[str]) -> Tensor:
+    """Vectorize a module according to the order given in names."""
     return torch.cat([m.get_parameter(name).flatten() for name in names])
 
-def squared_distance_matrix(a: List[nn.Module], b: List[nn.Module]) -> Tensor:
-    """Calculates the (l2) distance matrix of every module in a to every module in b."""
-
-    if len(a) != len(b):
-        raise ValueError("Bipartite matching needs a bipartite graph")
-    
-    if len(a) == 0:
-        return torch.zeroes((0,0))
-
-    names = [name for name, _ in a[0].named_parameters()]
-    a_vec = torch.stack([vectorize(m, names) for m in a])
-    b_vec = torch.stack([vectorize(m, names) for m in b])
-    return torch.cdist(a_vec, b_vec)
-
 class Matcher(ABC):
-    def match(a: List[nn.Module], b: List[nn.Module]) -> List[Tuple[int, int]]:
-        """Match the client blocks to each other to minimize some distance metric."""
+    def match(clients: Tensor) -> Tensor:
+        """
+        clients: C x m x d array of vectorized attention heads, from the C clients each with m attention heads
+        returns: C x m matrix of cluster ids ranging from [0, m), with the first row being in order [0, 1, ..., m-1]
+        """
         # TODO: gooder documentation
         pass
 
 class GreedyMatcher(Matcher):
-    def match(a: List[nn.Module], b: List[nn.Module]) -> List[Tuple[int, int]]:
+    def match(clients: Tensor) -> Tensor:
         """Le Greedy"""
         pass
 
 class HungarianMatcher(Matcher):
-    def match(a: List[nn.Module], b: List[nn.Module]) -> List[Tuple[int, int]]:
+    def match(clients: Tensor) -> Tensor:
         """Le Hungarian ala FedMA"""
         pass
