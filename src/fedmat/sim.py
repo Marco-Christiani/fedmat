@@ -271,9 +271,9 @@ def flatten_heads_for_matching(layer: TransformerBlock) -> torch.Tensor:
     out_features, in_features = W.shape
     assert in_features == H * hd
     W = W.view(out_features, H, hd)
-    W_heads = W.permute(1, 0, 2).contiguous().view(H, -1)
+    w_heads = W.permute(1, 0, 2).contiguous().view(H, -1)
 
-    return torch.cat([qkv_heads, W_heads], dim=1)
+    return torch.cat([qkv_heads, w_heads], dim=1)
 
 
 def align_client_to_ref(client: Transformer, ref: Transformer) -> Transformer:
@@ -327,8 +327,7 @@ def align_all_clients_to_first(clients: list[Transformer]) -> list[Transformer]:
     """
     ref = clients[0]
     aligned = [copy.deepcopy(ref)]
-    for c in clients[1:]:
-        aligned.append(align_client_to_ref(copy.deepcopy(c), ref))
+    aligned.extend(align_client_to_ref(copy.deepcopy(c), ref) for c in clients[1:])
     return aligned
 
 

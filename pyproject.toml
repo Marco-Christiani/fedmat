@@ -84,10 +84,8 @@ select = [
     "C", # McCabe complexity (https://docs.astral.sh/ruff/rules/#mccabe-c90)
     "D", # pydocstyle (https://docs.astral.sh/ruff/rules/#pydocstyle-d)
     "E", # pycodestyle (https://docs.astral.sh/ruff/rules/#warning-w)
-    "F401", # flakes unused import (https://docs.astral.sh/ruff/rules/unused-import/)
-    "F401", # flakes unused import (https://docs.astral.sh/ruff/rules/unused-import/)
+    "F", # flakes unused import (https://docs.astral.sh/ruff/rules/unused-import/)
     "FURB", # refurb (https://docs.astral.sh/ruff/rules/#refurb-furb)
-    "I", # isort (https://docs.astral.sh/ruff/rules/#isort-i)
     "I", # isort (https://docs.astral.sh/ruff/rules/#isort-i)
     "ICN", # flake8-import-conventions (https://docs.astral.sh/ruff/rules/#flake8-import-conventions-icn)
     "N", # PEP8 Naming (https://docs.astral.sh/ruff/rules/#pep8-naming-n)
@@ -107,6 +105,9 @@ ignore = [
   "E402",   # imports at top of file (https://docs.astral.sh/ruff/rules/module-import-not-at-top-of-file/)
   "TRY003" # Avoid specifying long messages outside the exception class
 ]
+
+[tool.ruff.lint.pep8-naming]
+ignore-names = ["[A-Z]", "[A-Z][0-9]"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"

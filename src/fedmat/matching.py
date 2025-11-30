@@ -1,7 +1,9 @@
+"""Matching utilities for aligning ViT attention heads across clients."""
+
 from __future__ import annotations
 
 from abc import ABC
-from typing import TYPE_CHECKING, Dict, List, Type
+from typing import TYPE_CHECKING, List
 
 import torch
 from torch import Tensor, nn
@@ -11,6 +13,7 @@ if TYPE_CHECKING:
 
 
 def module_names(m: nn.Module) -> List[str]:
+    """Return parameter names for a module."""
     return [name for name, _ in m.named_parameters()]
 
 
@@ -20,51 +23,20 @@ def vectorize(m: nn.Module, names: List[str]) -> Tensor:
 
 
 class Matcher(ABC):
+    """Base class for head-matching implementations."""
+
     @staticmethod
     def match(layers: list[ViTLayer]) -> list[Tensor]:
-        """
-        clients: list of ViTLayer modules from different clients
-        returns: list of permutation tensors, one per client
-        """
-        raise NotImplementedError()
+        """Return a permutation per client layer."""
+        raise NotImplementedError("Subclasses must implement match().")
 
 
-# registry for matcher implementations
-_matcher_registry: Dict[str, Type[Matcher]] = {}
-
-
-def register_matcher(name: str):
-    """Decorator to register a Matcher implementation under a string name."""
-
-    def _decorator(cls: Type[Matcher]) -> Type[Matcher]:
-        if not issubclass(cls, Matcher):
-            raise TypeError("Can only register subclasses of Matcher")
-        _matcher_registry[name] = cls
-        return cls
-
-    return _decorator
-
-
-def get_matcher(name: str, *args, **kwargs) -> Matcher:
-    """Return an instance of the matcher registered under `name`."""
-    try:
-        cls = _matcher_registry[name]
-    except KeyError:
-        raise KeyError(f"Unknown matcher '{name}'. Available: {list(_matcher_registry.keys())}")
-    return cls(*args, **kwargs)
-
-
-def registered_matchers() -> List[str]:
-    return list(_matcher_registry.keys())
-
-
-@register_matcher("greedy")
 class GreedyMatcher(Matcher):
+    """Greedy head-matching implementation."""
+
     @staticmethod
     def match(layers: list[ViTLayer]) -> list[Tensor]:
-        """
-        Greedy matching implementation.
-        """
+        """Greedy matching implementation."""
         if len(layers) == 0:
             return []
 
@@ -79,16 +51,16 @@ class GreedyMatcher(Matcher):
             parts: List[Tensor] = []
 
             for proj in (sa.query, sa.key, sa.value):
-                W = proj.weight.data  # [D, D]
-                W4 = W.view(n_head, hd, d_embed)  # [H, hd, d_embed]
-                parts.append(W4.contiguous().view(n_head, -1))
+                w = proj.weight.data  # [D, D]
+                w4 = w.view(n_head, hd, d_embed)  # [H, hd, d_embed]
+                parts.append(w4.contiguous().view(n_head, -1))
 
-            W_out = so.dense.weight.data  # [D_out, D_in]
-            out_features, in_features = W_out.shape
+            w_out = so.dense.weight.data  # [D_out, D_in]
+            out_features, in_features = w_out.shape
             assert in_features == d_embed
-            W3 = W_out.view(out_features, n_head, hd)  # [D_out, H, hd]
-            W_heads = W3.permute(1, 0, 2).contiguous().view(n_head, -1)
-            parts.append(W_heads)
+            w3 = w_out.view(out_features, n_head, hd)  # [D_out, H, hd]
+            w_heads = w3.permute(1, 0, 2).contiguous().view(n_head, -1)
+            parts.append(w_heads)
 
             return torch.cat(parts, dim=1)
 
@@ -100,18 +72,18 @@ class GreedyMatcher(Matcher):
             device = torch.device("cpu")
 
         ref_flat = _flatten_layer(ref_layer).to(device)
-        H = ref_flat.shape[0]
+        num_heads = ref_flat.shape[0]
 
         perms: List[Tensor] = []
-        perms.append(torch.arange(H, dtype=torch.long, device=device))
+        perms.append(torch.arange(num_heads, dtype=torch.long, device=device))
 
         for layer in layers[1:]:
             cli_flat = _flatten_layer(layer).to(device)
             cost = torch.cdist(ref_flat, cli_flat, p=2)
 
-            perm = torch.empty(H, dtype=torch.long, device=device)
-            unused = set(range(H))
-            for i in range(H):
+            perm = torch.empty(num_heads, dtype=torch.long, device=device)
+            unused = set(range(num_heads))
+            for i in range(num_heads):
                 row = cost[i]
                 best_j = min(unused, key=lambda j: float(row[j].item()))
                 perm[i] = best_j
@@ -122,8 +94,9 @@ class GreedyMatcher(Matcher):
         return perms
 
 
-@register_matcher("hungarian")
 class HungarianMatcher(Matcher):
+    """Placeholder for a Hungarian-matching implementation."""
+
     @staticmethod
     def match(layers: list["ViTLayer"]) -> list[Tensor]:
         """Le Hungarian ala FedMA (not implemented)."""
