@@ -15,12 +15,12 @@ from typing import TYPE_CHECKING, TypedDict
 import torch
 import wandb
 from tqdm.auto import tqdm
-from transformers import AutoImageProcessor, ViTConfig, ViTForImageClassification
+from transformers import AutoImageProcessor, ViTForImageClassification
 
 from . import utils
 from .data import Batch, build_dataloaders, load_cifar10_subsets
 from .evaluate import evaluate
-from .utils import default_device, get_amp_settings, set_seed
+from .utils import create_vit_classifier, default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -322,21 +322,13 @@ def main() -> None:
 
     image_processor = AutoImageProcessor.from_pretrained(cfg.model_name)
 
-    if cfg.use_pretrained:
-        logger.info("Using pretrained")
-        model = ViTForImageClassification.from_pretrained(cfg.model_name, num_labels=cfg.num_labels)
-    else:
-        logger.info("Not using pretrained")
-        model: ViTForImageClassification = ViTForImageClassification(
-            ViTConfig(
-                num_labels=cfg.num_labels,
-            )
-        )
+    model: ViTForImageClassification = create_vit_classifier(
+        model_name=cfg.model_name,
+        num_labels=cfg.num_labels,
+        use_pretrained=cfg.use_pretrained,
+    )
 
     logger.info("Model:\n%s", pformat(model))
-
-    model.config.id2label = {i: str(i) for i in range(cfg.num_labels)}
-    model.config.label2id = {str(i): i for i in range(cfg.num_labels)}
 
     _ = model.to(device)
 

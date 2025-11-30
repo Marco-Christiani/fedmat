@@ -8,6 +8,7 @@ from typing import Any, TypeVar
 
 import numpy as np
 import torch
+from transformers import ViTConfig, ViTForImageClassification
 
 T = TypeVar("T", bound=Mapping[str, Any])
 
@@ -58,6 +59,29 @@ def get_amp_settings(
     if device.type == "cuda" and enable_bf16:
         return True, torch.bfloat16
     return False, torch.float32
+
+
+def create_vit_classifier(
+    model_name: str,
+    num_labels: int,
+    use_pretrained: bool,
+) -> ViTForImageClassification:
+    """Construct a ViT classifier with consistent label mappings."""
+    if use_pretrained:
+        model = ViTForImageClassification.from_pretrained(
+            model_name,
+            num_labels=num_labels,
+        )
+    else:
+        model = ViTForImageClassification(
+            ViTConfig(
+                num_labels=num_labels,
+            )
+        )
+
+    model.config.id2label = {i: str(i) for i in range(num_labels)}
+    model.config.label2id = {str(i): i for i in range(num_labels)}
+    return model
 
 
 def aos_to_soa(aos: Sequence[T]) -> dict[str, list[Any]]:

@@ -23,7 +23,7 @@ from .data import Batch, build_dataloaders, load_cifar10_subsets
 from .evaluate import evaluate
 from .matching import get_matcher, registered_matchers
 from .permute import permute_vit_layer_heads
-from .utils import default_device, get_amp_settings, set_seed
+from .utils import create_vit_classifier, default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -232,73 +232,73 @@ def aggregate_models(
     """Aggregate client ViT models with per-layer matched averaging."""
     client_models: list[ViTForImageClassification] = []
     for sd in state_dicts:
-        m = ViTForImageClassification(template_config)
-        m.load_state_dict(sd)
-        m.to("cpu")
-        client_models.append(m)
+        model = ViTForImageClassification(template_config)
+        model.load_state_dict(sd)
+        model.to("cpu")
+        client_models.append(model)
 
-    agg_state: dict[str, torch.Tensor] = {}
+    aggregated_state: dict[str, torch.Tensor] = {}
 
-    ref_model = client_models[0]
-    num_layers = len(ref_model.vit.encoder.layer)
+    reference_model = client_models[0]
+    num_layers = len(reference_model.vit.encoder.layer)
 
     with torch.no_grad():
         for layer_idx in range(num_layers):
-            client_layers: list[ViTLayer] = [m.vit.encoder.layer[layer_idx] for m in client_models]
+            client_layers: list[ViTLayer] = [model.vit.encoder.layer[layer_idx] for model in client_models]
 
-            for lyr in client_layers:
-                lyr.to(device)
+            for layer in client_layers:
+                layer.to(device)
 
             if matcher is not None:
                 perms = matcher.match(client_layers)
-                for lyr, perm in zip(client_layers, perms):
-                    permute_vit_layer_heads(lyr, perm)
+                for layer, perm in zip(client_layers, perms):
+                    permute_vit_layer_heads(layer, perm)
 
-            param_maps = [dict(lyr.named_parameters()) for lyr in client_layers]
-            ref_param_map = param_maps[0]
+            param_maps = [dict(layer.named_parameters()) for layer in client_layers]
+            reference_param_map = param_maps[0]
 
-            for name, ref_param in ref_param_map.items():
+            for name, reference_param in reference_param_map.items():
                 full_name = f"vit.encoder.layer.{layer_idx}.{name}" if name else f"vit.encoder.layer.{layer_idx}"
-                tensors = [pm[name].data.float() for pm in param_maps]
+                tensors = [param_map[name].data.float() for param_map in param_maps]
                 stacked = torch.stack(tensors, dim=0)
-                avg = stacked.mean(dim=0).to(ref_param.dtype).cpu()
-                agg_state[full_name] = avg
+                avg = stacked.mean(dim=0).to(reference_param.dtype).cpu()
+                aggregated_state[full_name] = avg
 
-            buffer_maps = [dict(lyr.named_buffers()) for lyr in client_layers]
+            buffer_maps = [dict(layer.named_buffers()) for layer in client_layers]
             if buffer_maps:
-                ref_buffer_map = buffer_maps[0]
-                for name, ref_buf in ref_buffer_map.items():
+                reference_buffer_map = buffer_maps[0]
+                for name, reference_buffer in reference_buffer_map.items():
                     full_name = f"vit.encoder.layer.{layer_idx}.{name}" if name else f"vit.encoder.layer.{layer_idx}"
-                    if torch.is_floating_point(ref_buf):
-                        tensors = [bm[name].data.float() for bm in buffer_maps]
+                    if torch.is_floating_point(reference_buffer):
+                        tensors = [buffer_map[name].data.float() for buffer_map in buffer_maps]
                         stacked = torch.stack(tensors, dim=0)
-                        avg = stacked.mean(dim=0).to(ref_buf.dtype).cpu()
-                        agg_state[full_name] = avg
+                        avg = stacked.mean(dim=0).to(reference_buffer.dtype).cpu()
+                        aggregated_state[full_name] = avg
                     else:
-                        agg_state[full_name] = ref_buf.detach().cpu().clone()
+                        aggregated_state[full_name] = reference_buffer.detach().cpu().clone()
 
-            for lyr in client_layers:
-                lyr.to("cpu")
+            for layer in client_layers:
+                layer.to("cpu")
 
-    client_state_dicts = [m.state_dict() for m in client_models]
-    ref_sd = client_state_dicts[0]
+    client_state_dicts = [model.state_dict() for model in client_models]
+    reference_state_dict = client_state_dicts[0]
 
     with torch.no_grad():
-        for name, ref_tensor in ref_sd.items():
-            if name in agg_state:
+        for name, reference_tensor in reference_state_dict.items():
+            if name in aggregated_state:
                 continue
 
-            if torch.is_floating_point(ref_tensor):
+            if torch.is_floating_point(reference_tensor):
                 stacked = torch.stack(
                     [sd[name].to(device=device, dtype=torch.float32) for sd in client_state_dicts],
                     dim=0,
                 )
-                avg = stacked.mean(dim=0).to(ref_tensor.dtype).cpu()
-                agg_state[name] = avg
+                avg = stacked.mean(dim=0).to(reference_tensor.dtype).cpu()
+                aggregated_state[name] = avg
             else:
-                agg_state[name] = ref_tensor.detach().clone()
+                aggregated_state[name] = reference_tensor.detach().clone()
 
-    return agg_state
+    return aggregated_state
 
 
 def main() -> None:
@@ -367,16 +367,14 @@ def main() -> None:
     # Model (client copy on each rank)
     if cfg.use_pretrained:
         logger.info("Using pretrained backbone '%s'", cfg.model_name)
-        model = ViTForImageClassification.from_pretrained(
-            cfg.model_name,
-            num_labels=cfg.num_labels,
-        )
     else:
         logger.info("Training from scratch")
-        model = ViTForImageClassification(ViTConfig(num_labels=cfg.num_labels))
 
-    model.config.id2label = {i: str(i) for i in range(cfg.num_labels)}
-    model.config.label2id = {str(i): i for i in range(cfg.num_labels)}
+    model: ViTForImageClassification = create_vit_classifier(
+        model_name=cfg.model_name,
+        num_labels=cfg.num_labels,
+        use_pretrained=cfg.use_pretrained,
+    )
 
     model.to(device)
     if cfg.use_torch_compile:
@@ -399,13 +397,11 @@ def main() -> None:
     # Rank 0 keeps a CPU "server" model for aggregation/eval
     server_model: ViTForImageClassification | None = None
     if rank == 0:
-        if cfg.use_pretrained:
-            server_model = ViTForImageClassification.from_pretrained(
-                cfg.model_name,
-                num_labels=cfg.num_labels,
-            )
-        else:
-            server_model = ViTForImageClassification(ViTConfig(num_labels=cfg.num_labels))
+        server_model = create_vit_classifier(
+            model_name=cfg.model_name,
+            num_labels=cfg.num_labels,
+            use_pretrained=cfg.use_pretrained,
+        )
 
         cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
         server_model.load_state_dict(cpu_state)

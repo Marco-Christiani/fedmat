@@ -154,8 +154,8 @@ def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 
     for indices in class_indices:
         categorical = Categorical(dirichlet.sample())
         assignments = categorical.sample((len(indices),))
-        for i, assignments in enumerate(assignments):
-            client_indices[assignments].append(i)
+        for idx_within_class, assignment in enumerate(assignments):
+            client_indices[int(assignment.item())].append(indices[idx_within_class])
     return [RandomSampler(indices) for indices in client_indices]
 
 
