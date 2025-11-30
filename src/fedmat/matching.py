@@ -8,17 +8,17 @@ class Matcher(ABC):
         # TODO: gooder documentation
         pass
 
-class GreedyMatcher(ABC):
+class GreedyMatcher(Matcher):
     def match(client_blocks: List[nn.Module]) -> List[Tuple[int, int]]:
         """Le Greedy"""
         pass
 
-class PseudoHungarianMatcher(ABC):
+class PseudoHungarianMatcher(Matcher):
     def match(client_blocks: List[nn.Module]) -> List[Tuple[int, int]]:
         """Le Hungarian ala FedMA"""
         pass
 
-class PerfectMatcher(ABC):
+class PerfectMatcher(Matcher):
     def match(client_blocks: List[nn.Module]) -> List[Tuple[int, int]]:
         """Use some quantum error correction package to do matching"""
         pass
