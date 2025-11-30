@@ -22,10 +22,14 @@ from . import utils
 from .data import Batch, build_dataloaders, load_cifar10_subsets
 from .evaluate import evaluate
 from .utils import default_device, get_amp_settings, set_seed
+from .permute import permute_vit_layer_heads
+from .matching import get_matcher, registered_matchers
 
 if TYPE_CHECKING:
     from torch import Tensor
     from torch.utils.data import DataLoader
+    from transformers.models.vit.modeling_vit import ViTLayer
+    from .matching import Matcher
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +65,8 @@ class TrainConfig:
     homogeneity: float = 1.0
     num_clients: int = 1
     num_rounds: int = 1
+
+    use_matcher: str | None = None
 
 
 class MetricRecord(TypedDict):
@@ -219,20 +225,95 @@ def _try_init_distributed(cfg: TrainConfig) -> tuple[int, int]:
     return rank, world_size
 
 
-def aggregate_models(state_dicts: list[dict]) -> dict:
-    """Average a list of (CPU) state_dicts parameter-wise (FedAvg)."""
-    if not state_dicts:
-        raise ValueError("No state dicts to aggregate")
+def aggregate_models(
+    state_dicts: list[dict[str, torch.Tensor]],
+    template_config: ViTConfig,
+    device: torch.device,
+    matcher: Matcher | None = None,
+) -> dict[str, torch.Tensor]:
+    """Aggregate client ViT models with per-layer matched averaging."""
+    client_models: list[ViTForImageClassification] = []
+    for sd in state_dicts:
+        m = ViTForImageClassification(template_config)
+        m.load_state_dict(sd)
+        m.to("cpu")
+        client_models.append(m)
 
-    agg: dict[str, torch.Tensor] = {}
-    keys = list(state_dicts[0].keys())
+    agg_state: dict[str, torch.Tensor] = {}
 
-    for k in keys:
-        tensors = [sd[k].float() for sd in state_dicts]
-        stacked = torch.stack(tensors, dim=0)
-        agg[k] = stacked.mean(dim=0)
+    ref_model = client_models[0]
+    num_layers = len(ref_model.vit.encoder.layer)
 
-    return agg
+    with torch.no_grad():
+        for layer_idx in range(num_layers):
+            client_layers: list[ViTLayer] = [
+                m.vit.encoder.layer[layer_idx] for m in client_models
+            ]
+
+            for lyr in client_layers:
+                lyr.to(device)
+            
+            if matcher is not None:
+                perms = matcher.match(client_layers)
+                for lyr, perm in zip(client_layers, perms):
+                    permute_vit_layer_heads(lyr, perm)
+            
+            param_maps = [dict(lyr.named_parameters()) for lyr in client_layers]
+            ref_param_map = param_maps[0]
+
+            for name, ref_param in ref_param_map.items():
+                full_name = (
+                    f"vit.encoder.layer.{layer_idx}.{name}"
+                    if name
+                    else f"vit.encoder.layer.{layer_idx}"
+                )
+                tensors = [pm[name].data.float() for pm in param_maps]
+                stacked = torch.stack(tensors, dim=0)
+                avg = stacked.mean(dim=0).to(ref_param.dtype).cpu()
+                agg_state[full_name] = avg
+
+            buffer_maps = [dict(lyr.named_buffers()) for lyr in client_layers]
+            if buffer_maps:
+                ref_buffer_map = buffer_maps[0]
+                for name, ref_buf in ref_buffer_map.items():
+                    full_name = (
+                        f"vit.encoder.layer.{layer_idx}.{name}"
+                        if name
+                        else f"vit.encoder.layer.{layer_idx}"
+                    )
+                    if torch.is_floating_point(ref_buf):
+                        tensors = [bm[name].data.float() for bm in buffer_maps]
+                        stacked = torch.stack(tensors, dim=0)
+                        avg = stacked.mean(dim=0).to(ref_buf.dtype).cpu()
+                        agg_state[full_name] = avg
+                    else:
+                        agg_state[full_name] = ref_buf.detach().cpu().clone()
+
+            for lyr in client_layers:
+                lyr.to("cpu")
+
+    client_state_dicts = [m.state_dict() for m in client_models]
+    ref_sd = client_state_dicts[0]
+
+    with torch.no_grad():
+        for name, ref_tensor in ref_sd.items():
+            if name in agg_state:
+                continue
+
+            if torch.is_floating_point(ref_tensor):
+                stacked = torch.stack(
+                    [
+                        sd[name].to(device=device, dtype=torch.float32)
+                        for sd in client_state_dicts
+                    ],
+                    dim=0,
+                )
+                avg = stacked.mean(dim=0).to(ref_tensor.dtype).cpu()
+                agg_state[name] = avg
+            else:
+                agg_state[name] = ref_tensor.detach().clone()
+
+    return agg_state
 
 
 def main() -> None:
@@ -256,6 +337,7 @@ def main() -> None:
     parser.add_argument("-alpha", "--homogeneity", type=float, default=1.0)
     parser.add_argument("-c", "--num-clients", type=int, default=1)
     parser.add_argument("-r", "--num-rounds", type=int, default=TrainConfig.num_rounds)
+    parser.add_argument("-mat", "--use-matcher", type=str, default=None, choices=registered_matchers())
 
     args = parser.parse_args()
     cfg = TrainConfig(**vars(args))
@@ -266,7 +348,7 @@ def main() -> None:
 
     rank, world_size = _try_init_distributed(cfg)
 
-    # Optional Weights & Biases (only on rank 0)
+    # Optional wandb (only on rank 0)
     run = None
     if cfg.use_wandb and rank == 0:
         import wandb
@@ -343,6 +425,8 @@ def main() -> None:
         server_model.load_state_dict(cpu_state)
         server_model.to("cpu")
 
+        matcher = get_matcher(cfg.use_matcher) if cfg.use_matcher else None
+
     # Broadcast initial global model from server (rank 0) to all clients
     global_state_list: list[dict | None] = [None]
     if rank == 0:
@@ -377,7 +461,12 @@ def main() -> None:
         if rank == 0:
             assert server_model is not None
             logger.info("Aggregating %d client models on rank 0 (round %d)", len(gathered), round_idx + 1)
-            aggregated_state = aggregate_models(gathered)  # type: ignore[arg-type]
+            aggregated_state = aggregate_models(
+                gathered,
+                server_model.config,
+                device=device,
+                matcher=matcher,
+            )
             server_model.load_state_dict(aggregated_state)
 
             # Evaluate aggregated (server) model
