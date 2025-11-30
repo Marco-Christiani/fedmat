@@ -1,0 +1,24 @@
+_target_: fedmat.configs.TrainConfig
+run_name:
+seed: 42
+model_name: google/vit-base-patch16-224-in21k
+use_pretrained: true
+num_labels: 10
+learning_rate: 5e-4
+weight_decay: 0.01
+batch_size: 64
+epochs: 5
+max_grad_norm:
+log_every_n_steps: 50
+use_bf16: true
+use_torch_compile: false
+max_train_samples: 8000
+max_eval_samples: 1000
+num_workers: 4
+prefetch_factor: 4
+output_dir: outputs/vit_cifar10
+homogeneity: 1.0
+num_clients: 1
+num_rounds: 1
+mode: local
+matcher:

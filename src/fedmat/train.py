@@ -5,17 +5,19 @@ from __future__ import annotations
 import json
 import logging
 import os
-from argparse import ArgumentParser
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, TypedDict
 
+import hydra
 import torch
 import torch.distributed as dist
 import wandb
+from hydra.utils import instantiate, to_absolute_path
+from omegaconf import DictConfig, OmegaConf
 from tqdm.auto import tqdm
 from transformers import AutoImageProcessor, ViTConfig, ViTForImageClassification
 
@@ -31,45 +33,9 @@ if TYPE_CHECKING:
     from torch.utils.data import DataLoader
     from transformers.models.vit.modeling_vit import ViTLayer
 
+    from .configs import TrainConfig
+
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class TrainConfig:
-    """Config for ViT fine-tuning on CIFAR-10."""
-
-    run_name: str | None = None
-    seed: int = 42
-
-    model_name: str = "google/vit-base-patch16-224-in21k"
-    use_pretrained: bool = True
-    num_labels: int = 10
-
-    learning_rate: float = 5e-4
-    weight_decay: float = 0.01
-    batch_size: int = 64
-    epochs: int = 5
-    max_grad_norm: float | None = None
-    log_every_n_steps: int = 50
-    use_bf16: bool = True
-    use_torch_compile: bool = False
-
-    max_train_samples: int | None = 8_000
-    max_eval_samples: int | None = 1_000
-    num_workers: int = 4
-    prefetch_factor: int = 4
-
-    output_dir: Path = Path("outputs/vit_cifar10")
-
-    homogeneity: float = 1.0
-    num_clients: int = 1
-    num_rounds: int = 1
-
-    # Training mode: "local" or "federated"
-    mode: str = "local"
-
-    # Optional matcher used in federated mode
-    matcher: str | None = None
 
 
 class MetricRecord(TypedDict):
@@ -92,9 +58,16 @@ class TrainingMetadata:
     best_loss: float = float("inf")
 
 
+def _resolve_config_paths(config: TrainConfig) -> TrainConfig:
+    """Resolve all relative paths within the config."""
+    raw_output_dir = Path(config.output_dir)
+    output_dir = Path(to_absolute_path(raw_output_dir.as_posix()))
+    return replace(config, output_dir=output_dir)
+
+
 def _select_matcher(name: str | None) -> Matcher | None:
     """Select a matcher implementation by name.
-    
+
     This is here temporarily. Registry is better, but what this will be replaces with is better than both.
     """
     if name is None:
@@ -654,7 +627,7 @@ def _main_local(cfg: TrainConfig) -> float:
 
     logger.info("Evaluation accuracy: %.4f", accuracy)
     wandb.summary["eval/accuracy"] = accuracy
-    wandb.save(str(ckpt_path))
+    wandb.save(ckpt_path.as_posix())
 
     return float(accuracy)
 
@@ -742,60 +715,29 @@ def _main_federated(cfg: TrainConfig) -> float | None:
     return final_accuracy
 
 
-def main() -> None:
+@hydra.main(config_path="configs", config_name="experiment", version_base=None)
+def main(cfg: DictConfig) -> None:
     """Entry point for local and federated ViT training on CIFAR-10."""
-    parser = ArgumentParser(
-        prog="fedmat_train",
-        description="Train a round of FedMAT",
-        epilog="Copyright 2025 (TM) OC do not steal",
-    )
-    parser.add_argument("-e", "--epochs", type=int, default=TrainConfig.epochs)
-    parser.add_argument("-bs", "--batch-size", type=int, default=TrainConfig.batch_size)
-    parser.add_argument("-mts", "--max-train-samples", type=int)
-    parser.add_argument("-mes", "--max-eval-samples", type=int)
-    parser.add_argument("-nw", "--num-workers", type=int, default=TrainConfig.num_workers)
-    parser.add_argument("-pf", "--prefetch-factor", type=int, default=TrainConfig.prefetch_factor)
-    parser.add_argument("-bf16", "--use-bf16", action="store_true")
-    parser.add_argument("-tc", "--use-torch-compile", action="store_true")
-    parser.add_argument("-o", "--output-dir", type=Path, default=TrainConfig.output_dir)
-    parser.add_argument("-pre", "--use-pretrained", action="store_true")
-    parser.add_argument("-rn", "--run-name", type=str, default=TrainConfig.run_name)
-    parser.add_argument("-alpha", "--homogeneity", type=float, default=1.0)
-    parser.add_argument("-c", "--num-clients", type=int, default=1)
-    parser.add_argument("-r", "--num-rounds", type=int, default=TrainConfig.num_rounds)
-    parser.add_argument(
-        "-m",
-        "--mode",
-        type=str,
-        choices=["local", "federated"],
-        default=TrainConfig.mode,
-        help="Training mode: local or federated.",
-    )
-    parser.add_argument(
-        "-mat",
-        "--matcher",
-        type=str,
-        choices=["greedy", "hungarian"],
-        default=None,
-        help="Optional matcher used in federated mode.",
-    )
+    OmegaConf.resolve(cfg)
+    config: TrainConfig = instantiate(cfg)
+    resolved_config = _resolve_config_paths(config)
+    resolved_config.output_dir.mkdir(parents=True, exist_ok=True)
+    set_seed(resolved_config.seed)
 
-    args = parser.parse_args()
-    cfg = TrainConfig(**vars(args))
-    logger.info(pformat(cfg))
+    logger.info(pformat(resolved_config))
 
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    set_seed(cfg.seed)
-
-    wandb.init(
+    run = wandb.init(
         entity="fedmat-team",
         project="fedmat-project",
-        name=cfg.run_name,
-        config=asdict(cfg),
+        name=resolved_config.run_name,
+        config=asdict(resolved_config),
         mode="online",
-        dir=str(cfg.output_dir),
+        dir=resolved_config.output_dir.as_posix(),
     )
-    _ = _main_local(cfg) if cfg.mode == "local" else _main_federated(cfg)
+    try:
+        _ = _main_local(resolved_config) if resolved_config.mode == "local" else _main_federated(resolved_config)
+    finally:
+        run.finish()
 
 
 if __name__ == "__main__":
