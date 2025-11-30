@@ -71,6 +71,7 @@ def create_vit_classifier(
         model = ViTForImageClassification.from_pretrained(
             model_name,
             num_labels=num_labels,
+            # device_map="auto",
         )
     else:
         model = ViTForImageClassification(

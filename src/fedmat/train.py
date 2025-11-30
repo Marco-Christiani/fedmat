@@ -24,7 +24,6 @@ from transformers import AutoImageProcessor, ViTConfig, ViTForImageClassificatio
 from . import utils
 from .data import Batch, build_dataloaders, load_cifar10_subsets
 from .evaluate import evaluate
-from .matching import GreedyMatcher, HungarianMatcher, Matcher
 from .permute import permute_vit_layer_heads
 from .utils import create_vit_classifier, default_device, get_amp_settings, set_seed
 
@@ -34,6 +33,7 @@ if TYPE_CHECKING:
     from transformers.models.vit.modeling_vit import ViTLayer
 
     from .configs import TrainConfig
+    from .matching import Matcher
 
 logger = logging.getLogger(__name__)
 
@@ -63,21 +63,6 @@ def _resolve_config_paths(config: TrainConfig) -> TrainConfig:
     raw_output_dir = Path(config.output_dir)
     output_dir = Path(to_absolute_path(raw_output_dir.as_posix()))
     return replace(config, output_dir=output_dir)
-
-
-def _select_matcher(name: str | None) -> Matcher | None:
-    """Select a matcher implementation by name.
-
-    This is here temporarily. Registry is better, but what this will be replaces with is better than both.
-    """
-    if name is None:
-        return None
-    if name == "greedy":
-        return GreedyMatcher()
-    if name == "hungarian":
-        return HungarianMatcher()
-    msg = f"Unknown matcher '{name}'. Supported: 'greedy', 'hungarian', or None."
-    raise ValueError(msg)
 
 
 def _try_init_distributed(cfg: TrainConfig) -> tuple[int, int]:
@@ -121,7 +106,7 @@ def _initialize_server_and_matcher(
     device: torch.device,
 ) -> tuple[ViTForImageClassification | None, Matcher | None]:
     """Initialize server model (on rank 0) and matcher."""
-    matcher = _select_matcher(cfg.matcher)
+    matcher = cfg.matcher
     server_model: ViTForImageClassification | None = None
     if rank == 0:
         server_model = create_vit_classifier(

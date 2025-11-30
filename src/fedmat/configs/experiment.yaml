@@ -1,3 +1,6 @@
+defaults:
+  - matcher: null
+
 _target_: fedmat.configs.TrainConfig
 run_name:
 seed: 42
@@ -21,4 +24,3 @@ homogeneity: 1.0
 num_clients: 1
 num_rounds: 1
 mode: local
-matcher:

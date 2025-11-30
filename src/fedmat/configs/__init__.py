@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from fedmat.matching import Matcher
+
 
 @dataclass
 class TrainConfig:
@@ -41,4 +43,4 @@ class TrainConfig:
     num_rounds: int
 
     mode: str
-    matcher: str | None
+    matcher: Matcher | None
