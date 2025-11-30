@@ -8,7 +8,7 @@ def vectorize(m: nn.Module, names: List[str]) -> Tensor:
     return torch.cat([m.get_parameter(name).flatten() for name in names])
 
 def squared_distance_matrix(a: List[nn.Module], b: List[nn.Module]) -> Tensor:
-    """Calculates the distance matrix of every module in a to every module in b."""
+    """Calculates the (l2) distance matrix of every module in a to every module in b."""
 
     if len(a) != len(b):
         raise ValueError("Bipartite matching needs a bipartite graph")
@@ -16,7 +16,7 @@ def squared_distance_matrix(a: List[nn.Module], b: List[nn.Module]) -> Tensor:
     if len(a) == 0:
         return torch.zeroes((0,0))
 
-    names = [name for names, _ in a[0].named_parameters()]
+    names = [name for name, _ in a[0].named_parameters()]
     a_vec = torch.stack([vectorize(m, names) for m in a])
     b_vec = torch.stack([vectorize(m, names) for m in b])
     return torch.cdist(a_vec, b_vec)
