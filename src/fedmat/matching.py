@@ -1,19 +1,23 @@
 from __future__ import annotations
+
 from abc import ABC
-from typing import List, TYPE_CHECKING, Dict, Type
+from typing import TYPE_CHECKING, Dict, List, Type
 
 import torch
-from torch import nn, Tensor
+from torch import Tensor, nn
 
 if TYPE_CHECKING:
     from transformers.models.vit.modeling_vit import ViTLayer
 
+
 def module_names(m: nn.Module) -> List[str]:
     return [name for name, _ in m.named_parameters()]
+
 
 def vectorize(m: nn.Module, names: List[str]) -> Tensor:
     """Vectorize a module according to the order given in names."""
     return torch.cat([m.get_parameter(name).flatten() for name in names])
+
 
 class Matcher(ABC):
     @staticmethod
@@ -24,16 +28,22 @@ class Matcher(ABC):
         """
         raise NotImplementedError()
 
+
 # registry for matcher implementations
 _matcher_registry: Dict[str, Type[Matcher]] = {}
+
+
 def register_matcher(name: str):
     """Decorator to register a Matcher implementation under a string name."""
+
     def _decorator(cls: Type[Matcher]) -> Type[Matcher]:
         if not issubclass(cls, Matcher):
             raise TypeError("Can only register subclasses of Matcher")
         _matcher_registry[name] = cls
         return cls
+
     return _decorator
+
 
 def get_matcher(name: str, *args, **kwargs) -> Matcher:
     """Return an instance of the matcher registered under `name`."""
@@ -43,8 +53,10 @@ def get_matcher(name: str, *args, **kwargs) -> Matcher:
         raise KeyError(f"Unknown matcher '{name}'. Available: {list(_matcher_registry.keys())}")
     return cls(*args, **kwargs)
 
+
 def registered_matchers() -> List[str]:
     return list(_matcher_registry.keys())
+
 
 @register_matcher("greedy")
 class GreedyMatcher(Matcher):
@@ -108,6 +120,7 @@ class GreedyMatcher(Matcher):
             perms.append(perm)
 
         return perms
+
 
 @register_matcher("hungarian")
 class HungarianMatcher(Matcher):

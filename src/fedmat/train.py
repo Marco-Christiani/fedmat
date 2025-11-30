@@ -268,6 +268,8 @@ def train(
         wandb.summary["final/loss"] = metrics[-1]["loss"]
         wandb.summary["best/loss"] = training_metadata.best_loss
 
+    return metrics
+
 
 def main() -> None:
     """Vanilla train ViT on CIFAR-10."""

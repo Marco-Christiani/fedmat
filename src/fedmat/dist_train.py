@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from argparse import ArgumentParser
 from collections import defaultdict
 from dataclasses import asdict, dataclass
@@ -11,7 +12,6 @@ from datetime import datetime
 from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, TypedDict
-import os
 
 import torch
 import torch.distributed as dist
@@ -21,9 +21,9 @@ from transformers import AutoImageProcessor, ViTConfig, ViTForImageClassificatio
 from . import utils
 from .data import Batch, build_dataloaders, load_cifar10_subsets
 from .evaluate import evaluate
-from .utils import default_device, get_amp_settings, set_seed
-from .permute import permute_vit_layer_heads
 from .matching import get_matcher, registered_matchers
+from .permute import permute_vit_layer_heads
+from .utils import default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -151,14 +151,12 @@ def train_epoch(
         optimizer.step()
 
         metrics_loss_gpu[step] = loss.detach()
-        metrics_meta.append(
-            {
-                **epoch_metadata,
-                "step": step,
-                "global_step": training_metadata.global_step,
-                "loss": float("nan"),  # filled below
-            }
-        )
+        metrics_meta.append({
+            **epoch_metadata,
+            "step": step,
+            "global_step": training_metadata.global_step,
+            "loss": float("nan"),  # filled below
+        })
 
         running_loss_gpu += loss.detach()
         if training_metadata.global_step % cfg.log_every_n_steps == 0 or step == n_batches - 1:
@@ -246,27 +244,21 @@ def aggregate_models(
 
     with torch.no_grad():
         for layer_idx in range(num_layers):
-            client_layers: list[ViTLayer] = [
-                m.vit.encoder.layer[layer_idx] for m in client_models
-            ]
+            client_layers: list[ViTLayer] = [m.vit.encoder.layer[layer_idx] for m in client_models]
 
             for lyr in client_layers:
                 lyr.to(device)
-            
+
             if matcher is not None:
                 perms = matcher.match(client_layers)
                 for lyr, perm in zip(client_layers, perms):
                     permute_vit_layer_heads(lyr, perm)
-            
+
             param_maps = [dict(lyr.named_parameters()) for lyr in client_layers]
             ref_param_map = param_maps[0]
 
             for name, ref_param in ref_param_map.items():
-                full_name = (
-                    f"vit.encoder.layer.{layer_idx}.{name}"
-                    if name
-                    else f"vit.encoder.layer.{layer_idx}"
-                )
+                full_name = f"vit.encoder.layer.{layer_idx}.{name}" if name else f"vit.encoder.layer.{layer_idx}"
                 tensors = [pm[name].data.float() for pm in param_maps]
                 stacked = torch.stack(tensors, dim=0)
                 avg = stacked.mean(dim=0).to(ref_param.dtype).cpu()
@@ -276,11 +268,7 @@ def aggregate_models(
             if buffer_maps:
                 ref_buffer_map = buffer_maps[0]
                 for name, ref_buf in ref_buffer_map.items():
-                    full_name = (
-                        f"vit.encoder.layer.{layer_idx}.{name}"
-                        if name
-                        else f"vit.encoder.layer.{layer_idx}"
-                    )
+                    full_name = f"vit.encoder.layer.{layer_idx}.{name}" if name else f"vit.encoder.layer.{layer_idx}"
                     if torch.is_floating_point(ref_buf):
                         tensors = [bm[name].data.float() for bm in buffer_maps]
                         stacked = torch.stack(tensors, dim=0)
@@ -302,10 +290,7 @@ def aggregate_models(
 
             if torch.is_floating_point(ref_tensor):
                 stacked = torch.stack(
-                    [
-                        sd[name].to(device=device, dtype=torch.float32)
-                        for sd in client_state_dicts
-                    ],
+                    [sd[name].to(device=device, dtype=torch.float32) for sd in client_state_dicts],
                     dim=0,
                 )
                 avg = stacked.mean(dim=0).to(ref_tensor.dtype).cpu()
@@ -352,6 +337,7 @@ def main() -> None:
     run = None
     if cfg.use_wandb and rank == 0:
         import wandb
+
         run = wandb.init(
             entity="fedmat-team",
             project="fedmat-project",
