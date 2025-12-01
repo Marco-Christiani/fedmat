@@ -13,11 +13,14 @@ from pprint import pformat
 from typing import TYPE_CHECKING, TypedDict
 
 import hydra
+from hydra.core.hydra_config import HydraConfig
 import torch
 from hydra.utils import instantiate, to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from tqdm.auto import tqdm
 from transformers import AutoImageProcessor, ViTConfig, ViTForImageClassification
+import matplotlib.pyplot as plt
+import numpy as np
 
 from . import install_exception_handlers, install_global_log_context, set_log_context, utils
 from .data import Batch, build_dataloaders, load_cifar10_subsets
@@ -327,7 +330,7 @@ def train_epoch(
     training_metadata: TrainingMetadata,
     epoch_metadata: dict | None = None,
     epoch_name: str = "",
-) -> tuple[Metrics, float]:
+) -> Metrics:
     """Train model for one epoch.
 
     Parameters
@@ -349,8 +352,8 @@ def train_epoch(
 
     Returns
     -------
-    tuple[Metrics, float]
-        Tuple of (metrics_list, final_loss)
+    list[MetricRecord]
+        Metric records.
     """
     if epoch_metadata is None:
         epoch_metadata = {}
@@ -454,8 +457,8 @@ def train_epoch(
                             ckpt_path,
                         )
 
-                        if ctx is not None and getattr(cfg, "save_round_checkpoints", False):
-                            ctx.wandb_log_artifact("best-model", ckpt_path)
+                    if ctx is not None and getattr(cfg, "save_round_checkpoints", False):
+                        ctx.wandb_log_artifact("best-model", ckpt_path)
 
                 # reset local running stats
                 running_loss_gpu.zero_()
@@ -471,11 +474,13 @@ def train_epoch(
 
 
 def train(
+    *,
     model: ViTForImageClassification,
     dataloader: DataLoader[Batch],
     device: torch.device,
     cfg: TrainConfig,
     ctx: DistributedContext | None,
+    training_metadata: TrainingMetadata | None = None,
 ) -> Metrics:
     """Train model for multiple epochs.
 
@@ -489,15 +494,22 @@ def train(
         Device to train on
     cfg : TrainConfig
         Training configuration
+    ctx : DistributedContext | None
+        Distributed logging / comms context
+    training_metadata : TrainingMetadata | None
+        If provided, global_step and best_loss will be shared across calls.
+        If None, a fresh metadata object is created for this call.
 
     Returns
     -------
     Metrics
         List of metric records for all training steps
     """
+    if training_metadata is None:
+        training_metadata = TrainingMetadata()
+
     epoch_name_padding = " " * len(str(cfg.epochs))
-    metrics = []
-    training_metadata = TrainingMetadata()
+    metrics: Metrics = []
     for epoch in range(cfg.epochs):
         epoch_padded = epoch_name_padding + str(epoch)
         epoch_metrics = train_epoch(
@@ -557,7 +569,15 @@ def _main_local(cfg: TrainConfig, ctx: DistributedContext) -> float:
     train_dataloader = client_dataloaders[0]
 
     # Train
-    metrics_train = train(model, train_dataloader, device, cfg, ctx)
+    training_metadata = TrainingMetadata()
+    metrics_train = train(
+        model=model,
+        dataloader=train_dataloader,
+        device=device,
+        cfg=cfg,
+        ctx=ctx,
+        training_metadata=training_metadata,
+    )
     metrics = defaultdict(dict)
     metrics["train"] = utils.aos_to_soa(metrics_train)
 
@@ -576,6 +596,49 @@ def _main_local(cfg: TrainConfig, ctx: DistributedContext) -> float:
     fpath = cfg.output_dir / f"confusion_matrix-{now}.pt"
     logger.info("Saving confusion matrix data to %s", fpath)
     torch.save(confmat.cpu(), fpath)
+    # Create a static matplotlib PNG of the confusion matrix and upload as an artifact
+    try:
+        cm = confmat.cpu().numpy()
+        fig, ax = plt.subplots(figsize=(8, 8))
+        im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+        ax.figure.colorbar(im, ax=ax)
+
+        classes = list(range(cfg.num_labels))
+        ax.set(
+            xticks=np.arange(len(classes)),
+            yticks=np.arange(len(classes)),
+            xticklabels=classes,
+            yticklabels=classes,
+            ylabel="True label",
+            xlabel="Predicted label",
+            title="Confusion matrix",
+        )
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+        # annotate cells
+        fmt = "d"
+        thresh = cm.max() / 2.0 if cm.size else 0.0
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax.text(
+                    j,
+                    i,
+                    format(int(cm[i, j]), fmt),
+                    ha="center",
+                    va="center",
+                    color="white" if cm[i, j] > thresh else "black",
+                )
+
+        fig.tight_layout()
+        img_path = cfg.output_dir / f"confusion_matrix-{now}.png"
+        fig.savefig(img_path, dpi=150)
+        plt.close(fig)
+
+        if ctx.is_main:
+            # log the PNG as an artifact so it appears in the run files
+            ctx.wandb_log_artifact("confusion-matrix", img_path, artifact_type="visualization")
+    except Exception:
+        logger.exception("Failed to create/save confusion matrix figure")
 
     ckpt_path = cfg.output_dir / f"model-{now}.pt"
     logger.info("Saving checkpoint to %s", ckpt_path)
@@ -637,13 +700,21 @@ def _main_federated(cfg: TrainConfig, ctx: DistributedContext) -> float | None:
     final_confmat: torch.Tensor | None = None
 
     server_round_train_losses: list[float] = []
+    training_metadata = TrainingMetadata()
 
     for round_idx in range(cfg.num_rounds):
         logger.info("Starting communication round %d/%d", round_idx + 1, cfg.num_rounds)
 
-        round_metrics = train(model, train_dataloader, device, cfg, ctx)
+        round_metrics = train(
+            model=model,
+            dataloader=train_dataloader,
+            device=device,
+            cfg=cfg,
+            ctx=ctx,
+            training_metadata=training_metadata,
+        )
         all_train_metrics.extend(round_metrics)
-        global_step = len(all_train_metrics) # idk?
+        global_step = training_metadata.global_step
 
         round_train_loss = _compute_mean_loss(round_metrics)
         aggregated_round_loss: float | None = None
@@ -690,35 +761,6 @@ def _main_federated(cfg: TrainConfig, ctx: DistributedContext) -> float | None:
     return final_accuracy
 
 
-# def _driver(ctx: DistributedContext, cfg: TrainConfig) -> float | None:
-#     """Driver function executed per rank."""
-#     set_seed(cfg.seed)
-#     ctx.wandb_init(cfg)
-#     try:
-#         if cfg.mode == "local":
-#             return _main_local(cfg, ctx)
-#         return _main_federated(cfg, ctx)
-#     finally:
-#         ctx.wandb_finish()
-
-
-# @hydra.main(config_path="configs", config_name="experiment", version_base=None)
-# def main(cfg: DictConfig) -> None:
-#     """Entry point for local and federated ViT training on CIFAR-10."""
-#     OmegaConf.resolve(cfg)
-#     config: TrainConfig = instantiate(cfg)
-#     resolved_config = _resolve_config_paths(config)
-#     resolved_config.output_dir.mkdir(parents=True, exist_ok=True)
-
-#     logger.info(pformat(resolved_config))
-
-#     world_size = resolved_config.num_clients if resolved_config.mode == "federated" else 1
-#     ctx = DistributedContext(world_size=world_size)
-#     ctx.launch(_driver, resolved_config)
-
-from hydra.core.hydra_config import HydraConfig
-
-
 def _driver(ctx: DistributedContext, cfg: DictConfig) -> float | None:
     """Driver function executed per rank (and in the parent when world_size=1)."""
     # Build the runtime config here, after Hydra main, inside this process.
@@ -744,16 +786,8 @@ def _driver(ctx: DistributedContext, cfg: DictConfig) -> float | None:
 
 def _get_hydra_logging_cfg() -> dict:
     """Load Hydra's active job_logging dictConfig from the run directory."""
-    hydra_cfg_path = Path(HydraConfig.get().runtime.output_dir) / ".hydra" / "hydra.yaml"
-    ##
-    try:
-        hc = HydraConfig.get()
-        x = Path(hc.runtime.output_dir, hc.output_subdir or ".hydra", "hydra.yaml")
-        print(f"_get_hydra_logging_cfg {hydra_cfg_path=} {x=}")
-        assert hydra_cfg_path == x
-    except Exception as e:
-        print("_get_hydra_logging_cfg:", e)
-    ##
+    hc = HydraConfig.get()
+    hydra_cfg_path = Path(hc.runtime.output_dir, hc.output_subdir or ".hydra", "hydra.yaml")
     hydra_cfg = OmegaConf.load(hydra_cfg_path)
     job_logging_cfg = OmegaConf.to_container(hydra_cfg.hydra.job_logging, resolve=True)
     return job_logging_cfg
