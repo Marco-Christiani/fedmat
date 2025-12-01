@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
+import logging.config
 import sys
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict
 
 if TYPE_CHECKING:
     from asyncio import AbstractEventLoop
@@ -73,3 +74,101 @@ def install_exception_handlers(threading_: bool = False, asyncio_: bool = False)
         loop = asyncio.get_event_loop()
         if loop.get_exception_handler() is None:
             loop.set_exception_handler(_log_async_exception)
+
+
+_log_ctx = threading.local()
+
+
+def set_log_context(**kwargs: Any) -> None:
+    """Attach arbitrary metadata to log records (thread-local)."""
+    for k, v in kwargs.items():
+        setattr(_log_ctx, k, v)
+
+
+def clear_log_context() -> None:
+    """Clear all injected log context."""
+    _log_ctx.__dict__.clear()
+
+
+def install_global_log_context() -> None:
+    """Inject context into all log handlers and all future handlers."""
+    root = logging.getLogger()
+
+    filt = _ContextFilter()
+    for h in root.handlers:
+        h.addFilter(filt)
+
+    # Patch future handlers
+    _patch_logger_add_handler(filt)
+
+    # Patch existing formatters so they accept contextual fields
+    for h in root.handlers:
+        if h.formatter is not None:
+            _patch_formatter(h.formatter)
+
+
+class _ContextFilter(logging.Filter):
+    """Filter that injects thread-local context into all log records."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # defaults if nothing has been set yet
+        # if "rank" not in _log_ctx.__dict__:
+        #     setattr(record, "rank", "main")
+        # if "world_size" not in _log_ctx.__dict__:
+        #     setattr(record, "world_size", 1)
+
+        # # inject all context keys
+        # for k, v in _log_ctx.__dict__.items():
+        #     setattr(record, k, v)
+
+        # return True
+        defaults = {
+            "rank": "-",
+            "world_size": "-",
+            "backend": "-",
+        }
+
+        # defaults if field is missing
+        for k, v in defaults.items():
+            if not hasattr(record, k):
+                setattr(record, k, v)
+
+        # inject thread-local overrides
+        for k, v in _log_ctx.__dict__.items():
+            setattr(record, k, v)
+
+        return True
+
+
+def _patch_logger_add_handler(filt: logging.Filter) -> None:
+    """Monkey-patch Logger.addHandler so future handlers inherit the filter."""
+    orig_add_handler = logging.Logger.addHandler
+
+    def add_handler_with_patch(self, hdlr):
+        hdlr.addFilter(filt)
+        if hdlr.formatter is not None:
+            _patch_formatter(hdlr.formatter)
+        orig_add_handler(self, hdlr)
+
+    logging.Logger.addHandler = add_handler_with_patch
+
+
+def _patch_formatter(fmt: logging.Formatter) -> None:
+    """Ensure formatter templates include %(rank)s, %(world_size)s, etc."""
+    prefix = "[rank=%(rank)s world=%(world_size)s backend=%(backend)s] "
+
+    for attr in ("_fmt", "_style"):
+        obj = getattr(fmt, attr, None)
+        if not obj:
+            continue
+
+        # Case: standard formatter._fmt is a string.
+        if isinstance(obj, str):
+            if "%(rank)" not in obj:
+                setattr(fmt, attr, prefix + obj)
+            continue
+
+        # Case: old-style or new-style _style._fmt is a string.
+        style_fmt = getattr(obj, "_fmt", None)
+        if isinstance(style_fmt, str) and "%(rank)" not in style_fmt:
+            obj._fmt = prefix + style_fmt

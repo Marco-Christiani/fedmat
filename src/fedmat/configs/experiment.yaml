@@ -9,7 +9,7 @@ use_pretrained: true
 num_labels: 10
 learning_rate: 5e-4
 weight_decay: 0.01
-batch_size: 64
+batch_size: 1
 epochs: 5
 max_grad_norm:
 log_every_n_steps: 50
@@ -21,6 +21,7 @@ num_workers: 4
 prefetch_factor: 4
 output_dir: outputs/vit_cifar10
 homogeneity: 1.0
-num_clients: 1
+num_clients: 2
 num_rounds: 1
-mode: local
+mode: federated
+save_round_checkpoints: false
