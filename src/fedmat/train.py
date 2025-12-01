@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -100,6 +101,19 @@ def _broadcast_initial_state(
     return flat
 
 
+def _compute_mean_loss(metrics: Metrics) -> float | None:
+    """Return the mean loss from a list of metric records.
+
+    This is dumb.
+    """
+    if not metrics:
+        return None
+    losses = [rec["loss"] for rec in metrics if math.isfinite(rec["loss"])]
+    if not losses:
+        return None
+    return float(sum(losses) / len(losses))
+
+
 def _aggregate_and_evaluate_round(
     cfg: TrainConfig,
     server_model: ViTForImageClassification | None,
@@ -110,6 +124,7 @@ def _aggregate_and_evaluate_round(
     metadata: ModelFlatMetadata,
     round_idx: int,
     server_best_accuracy: float,
+    round_train_loss: float | None,
 ) -> tuple[torch.Tensor, float | None, torch.Tensor | None, float]:
     """Aggregate client models on rank 0, evaluate, and log artifacts."""
     aggregated_flat = torch.zeros_like(gathered[0])
@@ -158,14 +173,15 @@ def _aggregate_and_evaluate_round(
             logger.info("New best server model (acc=%.4f) saved to %s", server_best_accuracy, best_ckpt_path)
             ctx.wandb_log_artifact("best-server-model", best_ckpt_path)
 
-        ctx.wandb_log(
-            {
-                "round/number": round_idx + 1,
-                "round/server_accuracy": final_accuracy,
-                "round/server_best_accuracy": server_best_accuracy,
-            },
-            step=round_idx + 1,
-        )
+        log_payload = {
+            "round/number": round_idx + 1,
+            "round/server_accuracy": final_accuracy,
+            "round/server_best_accuracy": server_best_accuracy,
+        }
+        if round_train_loss is not None:
+            log_payload["round/server_train_loss"] = round_train_loss
+
+        ctx.wandb_log(log_payload, step=round_idx + 1)
 
     aggregated_flat = ctx.broadcast_tensor(aggregated_flat, src=0)
     return aggregated_flat, final_accuracy, final_confmat, server_best_accuracy
@@ -437,10 +453,7 @@ def train_epoch(
                             ckpt_path,
                         )
 
-                        if (
-                            ctx is not None
-                            and getattr(cfg, "save_round_checkpoints", False)
-                        ):
+                        if ctx is not None and getattr(cfg, "save_round_checkpoints", False):
                             ctx.wandb_log_artifact("best-model", ckpt_path)
 
                 # reset local running stats
@@ -622,11 +635,25 @@ def _main_federated(cfg: TrainConfig, ctx: DistributedContext) -> float | None:
     final_accuracy: float | None = None
     final_confmat: torch.Tensor | None = None
 
+    server_round_train_losses: list[float] = []
+
     for round_idx in range(cfg.num_rounds):
         logger.info("Starting communication round %d/%d", round_idx + 1, cfg.num_rounds)
 
         round_metrics = train(model, train_dataloader, device, cfg, ctx)
         all_train_metrics.extend(round_metrics)
+
+        round_train_loss = _compute_mean_loss(round_metrics)
+        aggregated_round_loss: float | None = None
+        if round_train_loss is not None:
+            loss_tensor = torch.tensor(round_train_loss, dtype=torch.float32, device=ctx.device)
+        else:
+            loss_tensor = torch.tensor(float("nan"), dtype=torch.float32, device=ctx.device)
+        gathered_losses = ctx.all_gather_tensor(loss_tensor)
+        finite_losses = [float(t.item()) for t in gathered_losses if math.isfinite(float(t.item()))]
+        if finite_losses:
+            aggregated_round_loss = sum(finite_losses) / len(finite_losses)
+            server_round_train_losses.append(aggregated_round_loss)
 
         local_flat = ctx.flatten_model(model)
         gathered = ctx.all_gather_tensor(local_flat)
@@ -641,15 +668,19 @@ def _main_federated(cfg: TrainConfig, ctx: DistributedContext) -> float | None:
             metadata=metadata,
             round_idx=round_idx,
             server_best_accuracy=server_best_accuracy,
+            round_train_loss=aggregated_round_loss,
         )
 
         ctx.unflatten_model(model, aggregated_flat)
 
     metrics = defaultdict(dict)
     metrics["train"] = utils.aos_to_soa(all_train_metrics)
+    if server_round_train_losses:
+        metrics["server"]["train_loss"] = server_round_train_losses
 
     if ctx.is_main and final_accuracy is not None:
         metrics["eval"]["accuracy"] = final_accuracy
+        metrics["server"]["eval_accuracy"] = final_accuracy
         _save_federated_artifacts(cfg, model, final_confmat, metrics)
         ctx.wandb_update_summary("eval/accuracy", final_accuracy)
 
