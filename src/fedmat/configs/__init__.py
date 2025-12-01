@@ -45,3 +45,4 @@ class TrainConfig:
     mode: str
     matcher: Matcher | None
     save_round_checkpoints: bool
+    dry: bool = False

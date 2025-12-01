@@ -124,6 +124,7 @@ def _aggregate_and_evaluate_round(
     metadata: ModelFlatMetadata,
     round_idx: int,
     server_best_accuracy: float,
+    global_step: int,
     round_train_loss: float | None,
 ) -> tuple[torch.Tensor, float | None, torch.Tensor | None, float]:
     """Aggregate client models on rank 0, evaluate, and log artifacts."""
@@ -181,7 +182,7 @@ def _aggregate_and_evaluate_round(
         if round_train_loss is not None:
             log_payload["round/server_train_loss"] = round_train_loss
 
-        ctx.wandb_log(log_payload, step=round_idx + 1)
+        ctx.wandb_log(log_payload, step=global_step)
 
     aggregated_flat = ctx.broadcast_tensor(aggregated_flat, src=0)
     return aggregated_flat, final_accuracy, final_confmat, server_best_accuracy
@@ -642,6 +643,7 @@ def _main_federated(cfg: TrainConfig, ctx: DistributedContext) -> float | None:
 
         round_metrics = train(model, train_dataloader, device, cfg, ctx)
         all_train_metrics.extend(round_metrics)
+        global_step = len(all_train_metrics) # idk?
 
         round_train_loss = _compute_mean_loss(round_metrics)
         aggregated_round_loss: float | None = None
@@ -668,6 +670,7 @@ def _main_federated(cfg: TrainConfig, ctx: DistributedContext) -> float | None:
             metadata=metadata,
             round_idx=round_idx,
             server_best_accuracy=server_best_accuracy,
+            global_step=global_step,
             round_train_loss=aggregated_round_loss,
         )
 
@@ -742,6 +745,15 @@ def _driver(ctx: DistributedContext, cfg: DictConfig) -> float | None:
 def _get_hydra_logging_cfg() -> dict:
     """Load Hydra's active job_logging dictConfig from the run directory."""
     hydra_cfg_path = Path(HydraConfig.get().runtime.output_dir) / ".hydra" / "hydra.yaml"
+    ##
+    try:
+        hc = HydraConfig.get()
+        x = Path(hc.runtime.output_dir, hc.output_subdir or ".hydra", "hydra.yaml")
+        print(f"_get_hydra_logging_cfg {hydra_cfg_path=} {x=}")
+        assert hydra_cfg_path == x
+    except Exception as e:
+        print("_get_hydra_logging_cfg:", e)
+    ##
     hydra_cfg = OmegaConf.load(hydra_cfg_path)
     job_logging_cfg = OmegaConf.to_container(hydra_cfg.hydra.job_logging, resolve=True)
     return job_logging_cfg
@@ -764,6 +776,10 @@ def main(cfg: DictConfig) -> None:
     log_cfg = _get_hydra_logging_cfg()
 
     ctx = DistributedContext(world_size=world_size)
+
+    if cfg.dry:
+        logger.warning(f"Got {cfg.dry=} ending.")
+        return
 
     try:
         ctx.launch(_driver, cfg, log_cfg=log_cfg)
