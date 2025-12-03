@@ -61,6 +61,7 @@ class GreedyMatcher(Matcher):
     """Greedy matching implementation."""
 
     @staticmethod
+    @torch.inference_mode()
     def match(layers: list[ViTLayer]) -> list[Tensor]:
         if len(layers) == 0:
             return []
@@ -99,6 +100,7 @@ class HungarianMatcher(Matcher):
     """Hungarian-matching implementation."""
 
     @staticmethod
+    @torch.inference_mode()
     def match(layers: list["ViTLayer"]) -> list[Tensor]:
         if len(layers) == 0:
             return []
