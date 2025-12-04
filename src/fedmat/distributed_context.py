@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import socket
+import threading
 from dataclasses import asdict
-from typing import Any, Callable, Optional
+from functools import wraps
+from typing import Any, Callable, Generic, Optional, ParamSpec, TypeVar
 
 import torch
 import torch.distributed as dist
-import wandb
 from torch.multiprocessing import get_context, spawn
 
+import wandb
 from fedmat import install_exception_handlers, install_global_log_context, set_log_context
-
-from .train_utils import ModelFlatMetadata, build_flat_metadata, flatten_state_dict, unflatten_state_dict
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +27,60 @@ def _get_free_port() -> int:
         return sock.getsockname()[1]
 
 
-class DistributedContext:
-    """Unified owner of distributed initialization, collectives, and experiment utilities."""
+T = TypeVar("T")
+P = ParamSpec("P")
+R = TypeVar("R")
 
-    def __init__(self, world_size: int) -> None:
-        self.requested_world_size = max(1, world_size)
+logger = logging.getLogger(__name__)
+
+
+class DirectReinitOfSingleton(Exception):
+    pass
+
+
+class ReinitOfSingleton(Exception):
+    pass
+
+
+class Singleton(Generic[T], type):
+    """Metaclass to enforce a per‑process singleton."""
+
+    _instance: Optional[T] = None
+    _lock: threading.Lock = threading.Lock()
+
+    def __call__(cls, *args: Any, **kwargs: Any) -> T:
+        try:
+            return cls.get(*args, **kwargs)
+        except ReinitOfSingleton as e:
+            raise DirectReinitOfSingleton(f"Use `{cls.__name__}.get()` with no arguments to get the instance.") from e
+
+    def get(cls, *args: Any, **kwargs: Any) -> T:
+        """Get or create singleton instance of the class.
+
+        Returns
+        -------
+            An instance of the class using this metaclass.
+        """
+        if cls._instance is None:  # guard against re-init
+            with cls._lock:
+                cls._instance = super().__call__(*args, **kwargs)  # avoid our __call__
+                assert cls._instance is not None
+        elif args or kwargs:
+            raise ReinitOfSingleton(
+                f"Attempted to reinit `Singleton` type `{cls.__name__}` by passing {args=} {kwargs=} to `.get() when an instance already exists {cls._instance}."
+            )
+        return cls._instance
+
+    def reset(cls) -> None:
+        """Clear the instance to force reinit on next `.get()`."""
+        cls._instance = None
+
+
+class DistributedContext(metaclass=Singleton["DistributedContext"]):
+    """Process local singleton with torch context."""
+
+    def __init__(self, world_size: int = 1) -> None:
+        self.requested_world_size = world_size
         self.rank = 0
         self.local_rank = 0
         self.world_size = 1
@@ -38,7 +88,6 @@ class DistributedContext:
         self._initialized = False
         self._is_spawn_parent = False
         self._wandb_run: Optional[wandb.sdk.wandb_run.Run] = None
-        self._metadata: Optional[ModelFlatMetadata] = None
 
     @property
     def is_distributed(self) -> bool:
@@ -46,14 +95,9 @@ class DistributedContext:
         return self._initialized and self.world_size > 1
 
     @property
-    def is_main(self) -> bool:
+    def is_main_process(self) -> bool:
         """Return True when this process is the designated main rank."""
         return self.rank == 0
-
-    @property
-    def metadata(self) -> ModelFlatMetadata | None:
-        """Return cached flattening metadata, if any."""
-        return self._metadata
 
     def launch(self, fn: Callable[[DistributedContext, Any], Any], config: Any, log_cfg: Any) -> Any:
         """Launch the provided driver either locally, via torchrun, or by spawning workers."""
@@ -117,6 +161,7 @@ class DistributedContext:
         if log_cfg is not None:
             import copy
             import logging.config
+
             lc = copy.deepcopy(log_cfg)
             logging.config.dictConfig(lc)
         else:
@@ -133,6 +178,7 @@ class DistributedContext:
             )
         # dump a python stack if we hit SIGBUS/SIGSEGV
         import faulthandler
+
         faulthandler.enable(all_threads=True)
 
         install_exception_handlers(threading_=True)
@@ -153,7 +199,6 @@ class DistributedContext:
             raise
         finally:
             ctx.shutdown()
-
 
     def _initialize_worker(self, rank: int, world_size: int) -> None:
         os.environ["RANK"] = str(rank)
@@ -194,7 +239,7 @@ class DistributedContext:
             device = torch.device(f"cuda:{device_index}")
             torch.cuda.set_device(device)
             return device
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # pragma: no cover - platform specific
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
 
@@ -235,9 +280,36 @@ class DistributedContext:
         dist.reduce_scatter_tensor(output, chunks)
         return output
 
+    @contextlib.contextmanager
+    def only_rank(self, r: int = 0, *, sync: bool = True):
+        """Run block only on given rank, with optional barrier fence."""
+        if sync:
+            self.barrier()
+        if self.rank == r:
+            yield
+        else:
+            yield from ()  # no-op for other ranks
+        if sync:
+            self.barrier()
+
+    @staticmethod
+    def on_rank(r: int = 0, sync: bool = True) -> Callable[[Callable[P, R]], Callable[P, R]]:
+        """Decorate a function to only run on given rank with optional barrier fence."""
+
+        def _deco(fn: Callable[P, R]) -> Callable[P, R]:
+            @wraps(fn)
+            def _wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+                ctx = DistributedContext.get()
+                with ctx.only_rank(r, sync=sync):
+                    return fn(*args, **kwargs)
+
+            return _wrapped
+
+        return _deco
+
     def wandb_init(self, cfg: Any) -> None:
         """Initialize a wandb run on the main rank."""
-        if not self.is_main:
+        if not self.is_main_process:
             return
         self._wandb_run = wandb.init(
             entity="fedmat-team",
@@ -250,43 +322,23 @@ class DistributedContext:
 
     def wandb_log(self, data: dict[str, Any], step: Optional[int] = None) -> None:
         """Log scalars to wandb on the main rank."""
-        if self.is_main and self._wandb_run is not None:
+        if self.is_main_process and self._wandb_run is not None:
             self._wandb_run.log(data, step=step)
 
     def wandb_update_summary(self, key: str, value: Any) -> None:
         """Update wandb summary values on the main rank."""
-        if self.is_main and self._wandb_run is not None:
+        if self.is_main_process and self._wandb_run is not None:
             self._wandb_run.summary[key] = value
 
     def wandb_log_artifact(self, name: str, path: os.PathLike[str] | str, artifact_type: str = "model") -> None:
         """Log a file artifact to wandb."""
-        if self.is_main and self._wandb_run is not None:
+        if self.is_main_process and self._wandb_run is not None:
             artifact = wandb.Artifact(name, type=artifact_type)
             artifact.add_file(str(path))
             self._wandb_run.log_artifact(artifact)
 
     def wandb_finish(self) -> None:
         """Finalize the wandb run on the main rank."""
-        if self.is_main and self._wandb_run is not None:
+        if self.is_main_process and self._wandb_run is not None:
             self._wandb_run.finish()
             self._wandb_run = None
-
-    def ensure_metadata(self, model: torch.nn.Module) -> ModelFlatMetadata:
-        """Return cached flattening metadata, creating it from the model if needed."""
-        if self._metadata is None:
-            with torch.no_grad():
-                state = model.state_dict()
-                self._metadata = build_flat_metadata(state)
-        return self._metadata
-
-    def flatten_model(self, model: torch.nn.Module) -> torch.Tensor:
-        """Flatten the model's state dict to a CPU tensor."""
-        metadata = self.ensure_metadata(model)
-        state = model.state_dict()
-        return flatten_state_dict(state, metadata)
-
-    def unflatten_model(self, model: torch.nn.Module, flat: torch.Tensor) -> None:
-        """Load flattened weights back into a model using cached metadata."""
-        metadata = self.ensure_metadata(model)
-        state = unflatten_state_dict(flat, metadata)
-        model.load_state_dict(state)

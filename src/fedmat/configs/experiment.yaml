@@ -10,10 +10,11 @@ use_pretrained: true
 num_labels: 10
 learning_rate: 5e-4
 weight_decay: 0.01
-batch_size: 1
-epochs: 5
+batch_size: 16
+epochs: 2
+local_steps: 700
 max_grad_norm:
-log_every_n_steps: 50
+log_every_n_steps: 100
 use_bf16: true
 use_torch_compile: false
 max_train_samples: 8000
@@ -22,8 +23,12 @@ num_workers: 4
 prefetch_factor: 4
 output_dir: ${hydra:runtime.output_dir}/vit_cifar10
 homogeneity: 1.0
-num_clients: 2
-num_rounds: 1
+num_clients: 5
+num_rounds: 5
 mode: federated
 save_round_checkpoints: false
+save_final_checkpoint: true
+matcher: null
+
+enable_timing: true
 dry: false

@@ -26,6 +26,7 @@ class TrainConfig:
     weight_decay: float
     batch_size: int
     epochs: int
+    local_steps: int
     max_grad_norm: float | None
     log_every_n_steps: int
     use_bf16: bool
@@ -45,4 +46,7 @@ class TrainConfig:
     mode: str
     matcher: Matcher | None
     save_round_checkpoints: bool
+    save_final_checkpoint: bool
+
+    enable_timing: bool = False
     dry: bool = False

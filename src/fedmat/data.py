@@ -51,6 +51,7 @@ def build_dataloaders(
     num_workers: int,
     prefetch_factor: int,
     device: torch.device,
+    drop_last: bool = False,
 ) -> tuple[list[DataLoader[Batch]], DataLoader[Batch]]:
     """Create DataLoaders and wrap them with CUDA prefetching when applicable."""
     collate_fn = Collator(image_processor)
@@ -61,6 +62,7 @@ def build_dataloaders(
         "collate_fn": collate_fn,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
+        "drop_last": drop_last,
     }
 
     # Only pass prefetch_factor when using workers

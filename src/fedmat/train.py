@@ -13,25 +13,25 @@ from pprint import pformat
 from typing import TYPE_CHECKING, TypedDict
 
 import hydra
-from hydra.core.hydra_config import HydraConfig
-import torch
-from hydra.utils import instantiate, to_absolute_path
-from omegaconf import DictConfig, OmegaConf
-from tqdm.auto import tqdm
-from transformers import AutoImageProcessor, ViTConfig, ViTForImageClassification
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+from hydra.core.hydra_config import HydraConfig
+from hydra.utils import instantiate, to_absolute_path
+from omegaconf import DictConfig, OmegaConf
+from torch import Tensor
+from tqdm.auto import tqdm
+from transformers import AutoImageProcessor, ViTConfig, ViTForImageClassification
 
 from . import install_exception_handlers, install_global_log_context, set_log_context, utils
 from .data import Batch, build_dataloaders, load_cifar10_subsets
 from .distributed_context import DistributedContext
 from .evaluate import evaluate
 from .permute import permute_vit_layer_heads
-from .train_utils import ModelFlatMetadata, flatten_state_dict, unflatten_state_dict
+from .train_utils import ModelFlatMetadata, StateDict, flatten_state_dict, unflatten_state_dict
 from .utils import create_vit_classifier, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
-    from torch import Tensor
     from torch.utils.data import DataLoader
     from transformers.models.vit.modeling_vit import ViTLayer
 
@@ -76,7 +76,7 @@ def _initialize_server_and_matcher(
     """Initialize server model (on rank 0) and matcher."""
     matcher = cfg.matcher
     server_model: ViTForImageClassification | None = None
-    if ctx.is_main:
+    if ctx.is_main_process:
         server_model = create_vit_classifier(
             model_name=cfg.model_name,
             num_labels=cfg.num_labels,
@@ -135,7 +135,7 @@ def _aggregate_and_evaluate_round(
     final_accuracy: float | None = None
     final_confmat: torch.Tensor | None = None
 
-    if ctx.is_main:
+    if ctx.is_main_process:
         assert server_model is not None
         state_dicts = [unflatten_state_dict(vec, metadata) for vec in gathered]
         logger.info("Aggregating %d client models on rank 0 (round %d)", len(state_dicts), round_idx + 1)
@@ -216,7 +216,7 @@ def _save_federated_artifacts(
 
 
 def _build_client_models(
-    state_dicts: list[dict[str, torch.Tensor]],
+    state_dicts: list[StateDict],
     template_config: ViTConfig,
 ) -> list[ViTForImageClassification]:
     """Instantiate client models on CPU from state dicts."""
@@ -233,9 +233,9 @@ def _aggregate_encoder_layers(
     client_models: list[ViTForImageClassification],
     device: torch.device,
     matcher: Matcher | None,
-) -> dict[str, torch.Tensor]:
+) -> StateDict:
     """Aggregate encoder layers with optional head matching."""
-    aggregated_state: dict[str, torch.Tensor] = {}
+    aggregated_state = StateDict()
 
     reference_model = client_models[0]
     num_layers = len(reference_model.vit.encoder.layer)
@@ -283,9 +283,9 @@ def _aggregate_encoder_layers(
 
 def _aggregate_remaining_parameters(
     client_models: list[ViTForImageClassification],
-    aggregated_state: dict[str, torch.Tensor],
+    aggregated_state: StateDict,
     device: torch.device,
-) -> dict[str, torch.Tensor]:
+) -> StateDict:
     """Aggregate all non-encoder parameters and buffers."""
     client_state_dicts = [model.state_dict() for model in client_models]
     reference_state_dict = client_state_dicts[0]
@@ -309,23 +309,22 @@ def _aggregate_remaining_parameters(
 
 
 def aggregate_models(
-    state_dicts: list[dict[str, torch.Tensor]],
+    state_dicts: list[StateDict],
     template_config: ViTConfig,
     device: torch.device,
     matcher: Matcher | None = None,
-) -> dict[str, torch.Tensor]:
+) -> StateDict:
     """Aggregate client ViT models with per-layer matched averaging."""
     client_models = _build_client_models(state_dicts, template_config)
     aggregated_state = _aggregate_encoder_layers(client_models, device, matcher)
-    aggregated_state = _aggregate_remaining_parameters(client_models, aggregated_state, device)
-    return aggregated_state
+    return _aggregate_remaining_parameters(client_models, aggregated_state, device)
 
 
 def train_epoch(
     model: ViTForImageClassification,
     dataloader: DataLoader[Batch],
     device: torch.device,
-    cfg: TrainConfig,
+    train_config: TrainConfig,
     ctx: DistributedContext | None,
     training_metadata: TrainingMetadata,
     epoch_metadata: dict | None = None,
@@ -361,11 +360,11 @@ def train_epoch(
 
     optimizer = torch.optim.SGD(
         model.parameters(),
-        lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
+        lr=train_config.learning_rate,
+        weight_decay=train_config.weight_decay,
     )
 
-    use_autocast, amp_dtype = get_amp_settings(device, cfg.use_bf16)
+    use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
 
     n_batches = len(dataloader)
 
@@ -381,7 +380,7 @@ def train_epoch(
         running_loss_gpu: Tensor = torch.zeros((), device=device)
         steps_since_log = 0
 
-        progress = tqdm(dataloader, desc=epoch_name) if (ctx and ctx.is_main) else dataloader
+        progress = tqdm(dataloader, desc=epoch_name) if (ctx and ctx.is_main_process) else dataloader
 
         for step, batch in enumerate(progress):
             training_metadata.global_step += 1
@@ -404,8 +403,8 @@ def train_epoch(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
-            if cfg.max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            if train_config.max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.max_grad_norm)
 
             optimizer.step()
 
@@ -418,7 +417,7 @@ def train_epoch(
             })
 
             running_loss_gpu += loss.detach()
-            if training_metadata.global_step % cfg.log_every_n_steps == 0 or step == len(dataloader) - 1:
+            if training_metadata.global_step % train_config.log_every_n_steps == 0 or step == len(dataloader) - 1:
                 avg_loss_gpu = running_loss_gpu / steps_since_log
                 avg_loss = float(avg_loss_gpu.item())
 
@@ -445,8 +444,8 @@ def train_epoch(
                 if avg_loss < training_metadata.best_loss:
                     training_metadata.best_loss = avg_loss
 
-                    if ctx is None or ctx.is_main:
-                        ckpt_path = cfg.output_dir / "best.pt"
+                    if ctx is None or ctx.is_main_process:
+                        ckpt_path = train_config.output_dir / "best.pt"
                         torch.save(
                             {
                                 **epoch_metadata,
@@ -457,7 +456,7 @@ def train_epoch(
                             ckpt_path,
                         )
 
-                    if ctx is not None and getattr(cfg, "save_round_checkpoints", False):
+                    if ctx is not None and train_config.save_round_checkpoints:
                         ctx.wandb_log_artifact("best-model", ckpt_path)
 
                 # reset local running stats
@@ -524,7 +523,7 @@ def train(
         )
         metrics.extend(epoch_metrics)
 
-    if ctx is not None and ctx.is_main:
+    if ctx is not None and ctx.is_main_process:
         ctx.wandb_update_summary("final/loss", metrics[-1]["loss"])
         ctx.wandb_update_summary("best/loss", training_metadata.best_loss)
     return metrics
@@ -634,7 +633,7 @@ def _main_local(cfg: TrainConfig, ctx: DistributedContext) -> float:
         fig.savefig(img_path, dpi=150)
         plt.close(fig)
 
-        if ctx.is_main:
+        if ctx.is_main_process:
             # log the PNG as an artifact so it appears in the run files
             ctx.wandb_log_artifact("confusion-matrix", img_path, artifact_type="visualization")
     except Exception:
@@ -645,9 +644,10 @@ def _main_local(cfg: TrainConfig, ctx: DistributedContext) -> float:
     torch.save(model.state_dict(), ckpt_path)
 
     logger.info("Evaluation accuracy: %.4f", accuracy)
-    if ctx.is_main:
+    if ctx.is_main_process:
         ctx.wandb_update_summary("eval/accuracy", accuracy)
-        ctx.wandb_log_artifact("final-model", ckpt_path)
+        if cfg.save_final_checkpoint:
+            ctx.wandb_log_artifact("final-model", ckpt_path)
 
     return float(accuracy)
 
@@ -693,6 +693,31 @@ def _main_federated(cfg: TrainConfig, ctx: DistributedContext) -> float | None:
     server_model, matcher = _initialize_server_and_matcher(cfg, model, ctx)
     metadata = ctx.ensure_metadata(model)
     _broadcast_initial_state(model, server_model, ctx)
+    # >>> NEW DEBUG BLOCK STARTS HERE <<<
+    # import hashlib
+    # Build a deterministic hash of the metadata.names sequence on each rank
+    # names_bytes = "|".join(metadata.names).encode("utf-8")
+    # local_hash_int = int.from_bytes(
+    #     hashlib.sha256(names_bytes).digest()[:8], byteorder="big", signed=False
+    # )
+    # local_hash_tensor = torch.tensor(local_hash_int, dtype=torch.int64, device="cpu")
+
+    import hashlib, torch
+
+    names_bytes = "|".join(metadata.names).encode()
+    h = hashlib.sha256(names_bytes).digest()[:8]
+    i = int.from_bytes(h, "big", signed=False)
+
+    # safe signed int64
+    local_hash_tensor = torch.tensor(i & 0x7FFFFFFFFFFFFFFF, dtype=torch.int64)
+
+    hash_tensors = ctx.all_gather_tensor(local_hash_tensor)
+    if ctx.is_main_process:
+        hash_vals = [int(t.item()) for t in hash_tensors]
+        logger.info("Per-rank metadata hash: %s", hash_vals)
+        # Hard assert for debugging: if this trips, we FOUND the bug.
+        assert all(h == hash_vals[0] for h in hash_vals), "Metadata mismatch across ranks!"
+    # <<< NEW DEBUG BLOCK ENDS HERE <<<
 
     all_train_metrics: Metrics = []
     server_best_accuracy = float("-inf")
@@ -752,7 +777,7 @@ def _main_federated(cfg: TrainConfig, ctx: DistributedContext) -> float | None:
     if server_round_train_losses:
         metrics["server"]["train_loss"] = server_round_train_losses
 
-    if ctx.is_main and final_accuracy is not None:
+    if ctx.is_main_process and final_accuracy is not None:
         metrics["eval"]["accuracy"] = final_accuracy
         metrics["server"]["eval_accuracy"] = final_accuracy
         _save_federated_artifacts(cfg, model, final_confmat, metrics)
@@ -787,6 +812,7 @@ def _driver(ctx: DistributedContext, cfg: DictConfig) -> float | None:
 def _get_hydra_logging_cfg() -> dict:
     """Load Hydra's active job_logging dictConfig from the run directory."""
     hc = HydraConfig.get()
+    hc.runtime.output_dir
     hydra_cfg_path = Path(hc.runtime.output_dir, hc.output_subdir or ".hydra", "hydra.yaml")
     hydra_cfg = OmegaConf.load(hydra_cfg_path)
     job_logging_cfg = OmegaConf.to_container(hydra_cfg.hydra.job_logging, resolve=True)
