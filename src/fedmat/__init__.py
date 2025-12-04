@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-import logging.config
 import sys
 import threading
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from asyncio import AbstractEventLoop

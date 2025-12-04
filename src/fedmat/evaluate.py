@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from torch.utils.data import DataLoader
     from transformers import ViTForImageClassification
 
-    from .data import Batch
+    from fedmat.data import Batch
 
 
 @torch.inference_mode()

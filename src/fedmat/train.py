@@ -7,7 +7,7 @@ import copy
 import logging
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, TypedDict
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import hydra
 import polars as pl
@@ -19,10 +19,12 @@ from transformers import AutoImageProcessor, ViTForImageClassification
 from fedmat import install_exception_handlers, install_global_log_context, set_log_context
 from fedmat.data import Batch, build_dataloaders, load_named_dataset_subsets
 from fedmat.evaluate import evaluate
-from fedmat.train_utils import ModelReshaper, aggregate_models, clone_state_dict, log_run_artifacts
-from fedmat.utils import create_vit_classifier, get_amp_settings, set_seed
+from fedmat.train_utils import ModelReshaper, StateDict, aggregate_models, clone_state_dict, log_run_artifacts
+from fedmat.utils import create_vit_classifier, default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from fedmat.config import TrainConfig
 
 logger = logging.getLogger(__name__)
@@ -38,19 +40,9 @@ class MetricRow(TypedDict):
     loss: float
 
 
-def _select_device() -> torch.device:
-    """Select the best available device for serial training."""
-    if torch.cuda.is_available():
-        torch.cuda.set_device(0)
-        return torch.device("cuda:0")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
 def _run_fed_training(train_config: TrainConfig) -> float | None:
     """Execute the federated training loop with per-step multi-client scheduling."""
-    device = _select_device()
+    device = default_device()
     logger.info("Using device: %s", device)
 
     train_ds, eval_ds = load_named_dataset_subsets(
@@ -77,12 +69,11 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
         num_labels=train_config.num_labels,
         use_pretrained=train_config.use_pretrained,
     )
-    model.to(device)
+    _ = model.to(device=device)  # type: ignore
     if train_config.use_torch_compile:
         model.compile()
 
     # Flatten metadata from the server model once
-    # metadata = build_flat_metadata(model.state_dict())
     reshaper = ModelReshaper()
 
     global_state = copy.deepcopy(model.state_dict())
@@ -92,7 +83,7 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
     final_confmat: torch.Tensor | None = None
     best_server_accuracy = float("-inf")
 
-    # set up streams if on cuda.
+    # set up streams if on cuda
     streams: list[torch.cuda.Stream | None] = [
         torch.cuda.Stream(device=device) if device.type == "cuda" else None for _ in range(train_config.num_clients)
     ]
@@ -115,7 +106,7 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
         for client_idx, dataloader in enumerate(client_dataloaders):
             client_model = copy.deepcopy(model)  # init from current server arch
             client_model.load_state_dict(global_state)
-            client_model.to(device)
+            _ = client_model.to(device=device)
 
             optimizer = torch.optim.SGD(
                 client_model.parameters(),
@@ -209,7 +200,7 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
                     )
 
                     if do_log and running_loss_gpu[client_idx] is not None:
-                        avg_loss_gpu = running_loss_gpu[client_idx] / steps_since_log[client_idx]
+                        avg_loss_gpu = running_loss_gpu[client_idx] / steps_since_log[client_idx]  # type: ignore
                         avg_loss = float(avg_loss_gpu.item())  # sync
                         logger.info(
                             "Round %d client %d local_step %d global_step %d avg_loss=%.4f",
@@ -230,48 +221,39 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
         # Timing end for local training.
         if train_config.enable_timing:
             if device.type == "cuda":
-                end_evt.record()
+                end_evt.record()  # type: ignore
                 torch.cuda.synchronize()
-                elapsed_s = start_evt.elapsed_time(end_evt) / 1000
+                elapsed_s = start_evt.elapsed_time(end_evt) / 1000  # pyright: ignore[reportPossiblyUnboundVariable]
             else:
-                elapsed_s = time.perf_counter() - start_time
+                elapsed_s = time.perf_counter() - start_time  # pyright: ignore[reportPossiblyUnboundVariable]
             logger.info(
                 "Round %d local training time: %.3f s",
                 round_idx + 1,
                 elapsed_s,
             )
 
-
         # Aggregate client models into a new global state
         if train_config.enable_timing:
             start_time = time.perf_counter()
-        client_states = [client_model.state_dict() for client_model in client_models]
+        client_states = [cast("StateDict", client_model.state_dict()) for client_model in client_models]
         if train_config.enable_timing:
-            elapsed_s = time.perf_counter() - start_time
-            logger.info(
-                "Round %d communication time: %.3f s",
-                round_idx + 1,
-                elapsed_s
-            )
+            elapsed_s = time.perf_counter() - start_time  # type: ignore
+            logger.info("Round %d communication time: %.3f s", round_idx + 1, elapsed_s)  # pyright: ignore[reportPossiblyUnboundVariable]
             start_time = time.perf_counter()
         aggregated_state = aggregate_models(
             client_states,
-            model.config,
+            model.config,  # type: ignore
             device=device,
             matcher=train_config.matcher,
         )
         if train_config.enable_timing:
-            elapsed_s = time.perf_counter() - start_time
-            logger.info(
-                "Round %d aggregation time: %.3f s",
-                round_idx + 1,
-                elapsed_s
-            )
+            elapsed_s = time.perf_counter() - start_time  # pyright: ignore[reportPossiblyUnboundVariable]
+            logger.info("Round %d aggregation time: %.3f s", round_idx + 1, elapsed_s)
 
         # Canonicalize model weights via flat + unflat and load
         flat = reshaper.flatten(aggregated_state)
         reshaper.unflatten_model(model, flat)
-        global_state = clone_state_dict(model.state_dict(), device=device)
+        global_state = clone_state_dict(cast("StateDict", model.state_dict()), device=device)
 
         accuracy, confmat = evaluate(
             model,

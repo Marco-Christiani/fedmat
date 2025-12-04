@@ -6,24 +6,26 @@ import json
 from collections import OrderedDict
 from dataclasses import dataclass, fields
 from datetime import datetime
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 import torch
+import wandb
 from torch import Tensor, nn
 from transformers import ViTForImageClassification
 
-import wandb
 from fedmat.distributed_context import DistributedContext
 from fedmat.permute import permute_vit_layer_heads
+from fedmat.utils import as_vit_layer
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     import polars as pl
     from transformers import ViTConfig
     from transformers.models.vit.modeling_vit import ViTLayer
 
-    from fedmat.configs import TrainConfig
+    from fedmat.config import TrainConfig
     from fedmat.matching import Matcher
 
 StateDict = OrderedDict[str, Tensor]
@@ -83,7 +85,7 @@ def flatten_state_dict(state_dict: StateDict, metadata: ModelFlatMetadata) -> Te
 @torch.no_grad()
 def unflatten_state_dict(flat: Tensor, metadata: ModelFlatMetadata) -> StateDict:
     """Rebuild a state dict from a flat tensor."""
-    out: StateDict = OrderedDict()
+    out = StateDict()
     offset = 0
 
     for name, shape, dtype, numel in metadata:
@@ -143,7 +145,9 @@ def _aggregate_encoder_layers(
 
     with torch.no_grad():
         for layer_idx in range(num_layers):
-            client_layers: list[ViTLayer] = [model.vit.encoder.layer[layer_idx] for model in client_models]
+            client_layers: list[ViTLayer] = [
+                as_vit_layer(model.vit.encoder.layer[layer_idx]) for model in client_models
+            ]
 
             for layer in client_layers:
                 layer.to(device)

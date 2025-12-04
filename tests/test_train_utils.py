@@ -1,27 +1,28 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Dict
 
 import pytest
 import torch
-from torch import nn, Tensor
-
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from torch import Tensor, nn
 
 from fedmat.train_utils import (
+    ModelFlatMetadata,
+    ModelReshaper,
     StateDict,
     build_flat_metadata,
+    clone_state_dict,
     flatten_state_dict,
     unflatten_state_dict,
-    clone_state_dict,
-    ModelReshaper,
 )
 
+# Fixtures ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Tiny deterministic model + fixtures
-# ---------------------------------------------------------------------------
+
+TinyNetState = tuple[nn.Module, StateDict, ModelFlatMetadata]
+
 
 class TinyNet(nn.Module):
     def __init__(self) -> None:
@@ -31,16 +32,17 @@ class TinyNet(nn.Module):
 
 
 @pytest.fixture
-def tinynet_state() -> tuple[nn.Module, StateDict, "ModelFlatMetadata"]:
-    """
-    Deterministic TinyNet + state dict + metadata.
+def tinynet_state() -> TinyNetState:
+    """TinyNet + state dict + metadata.
 
     Note: state dict includes both float and int tensors (e.g. num_batches_tracked),
-    which is important for testing dtype behavior realistically.
+      for testing dtype behavior realistically.
     """
     torch.manual_seed(0)
     model = TinyNet()
-    state: StateDict = model.state_dict()
+    state_ = model.state_dict()
+    assert isinstance(state_, OrderedDict)
+    state: OrderedDict = state_  # yay, python! ridiculous.
 
     # Fill tensors with deterministic ascending values, preserving dtype.
     for name, t in state.items():
@@ -59,11 +61,10 @@ def tinynet_state() -> tuple[nn.Module, StateDict, "ModelFlatMetadata"]:
     return model, state, meta
 
 
-# ---------------------------------------------------------------------------
-# Deterministic tests
-# ---------------------------------------------------------------------------
+#  Tests -----------------------------------------------------------------------
 
-def test_metadata_matches(tinynet_state) -> None:
+
+def test_metadata_matches(tinynet_state: TinyNetState) -> None:
     _, state, meta = tinynet_state
 
     assert list(state.keys()) == list(meta.names)
@@ -73,7 +74,7 @@ def test_metadata_matches(tinynet_state) -> None:
     assert meta.total_numel == sum(t.numel() for t in state.values())
 
 
-def test_roundtrip_flat_unflat(tinynet_state) -> None:
+def test_roundtrip_flat_unflat(tinynet_state: TinyNetState) -> None:
     _, state, meta = tinynet_state
 
     flat = flatten_state_dict(state, meta)
@@ -86,7 +87,7 @@ def test_roundtrip_flat_unflat(tinynet_state) -> None:
         assert torch.allclose(orig, new)
 
 
-def test_flatten_order_is_metadata_driven(tinynet_state) -> None:
+def test_flatten_order_is_metadata_driven(tinynet_state: TinyNetState) -> None:
     """Make sure metadata control is correct.
 
     Even if the input OrderedDict has a different insertion order,
@@ -107,16 +108,15 @@ def test_flatten_order_is_metadata_driven(tinynet_state) -> None:
     assert torch.allclose(flat1.to(dtype=torch.float32), flat2.to(dtype=torch.float32))
 
 
-def test_clone_state_dict_cpu(tinynet_state) -> None:
+def test_clone_state_dict_cpu(tinynet_state: TinyNetState) -> None:
     _, state, _ = tinynet_state
 
-    clone = clone_state_dict(state)
+    clone = clone_state_dict(state, device=torch.device("cpu"))
     assert set(clone.keys()) == set(state.keys())
 
     for k, v in state.items():
         assert clone[k].device.type == "cpu"
-        assert torch.allclose(v.cpu().to(dtype=torch.float32),
-                              clone[k].to(dtype=torch.float32))
+        assert torch.allclose(v.cpu().to(dtype=torch.float32), clone[k].to(dtype=torch.float32))
         assert clone[k] is not v
 
     # Mutation should not leak back
@@ -128,7 +128,7 @@ def test_clone_state_dict_cpu(tinynet_state) -> None:
     )
 
 
-def test_model_reshaper_roundtrip(tinynet_state) -> None:
+def test_model_reshaper_roundtrip(tinynet_state: TinyNetState) -> None:
     model, _, _ = tinynet_state
 
     reshaper = ModelReshaper()
@@ -139,7 +139,7 @@ def test_model_reshaper_roundtrip(tinynet_state) -> None:
     assert torch.allclose(flat.to(dtype=torch.float32), flat2.to(dtype=torch.float32))
 
 
-def test_unflatten_too_short_raises(tinynet_state) -> None:
+def test_unflatten_too_short_raises(tinynet_state: TinyNetState) -> None:
     """Make sure a shape mismatch blows up.
 
     unflatten_state_dict only fails when the reshaping fails (too short).
@@ -154,22 +154,22 @@ def test_unflatten_too_short_raises(tinynet_state) -> None:
     with pytest.raises(RuntimeError):
         reshaper.unflatten_model(model, too_short)
 
+
 # Property based tests -----------------------------------------------------------------------------
 
+
 @st.composite
-def tensor_shapes(draw) -> tuple[int, ...]:
+def tensor_shapes(draw: st.DrawFn) -> tuple[int, ...]:
     """Generate shapes up to rank 3, with side lengths in [0, 4]."""
     rank = draw(st.integers(min_value=0, max_value=3))
     if rank == 0:
         return ()
-    dims = []
-    for _ in range(rank):
-        dims.append(draw(st.integers(min_value=0, max_value=4)))
+    dims = [draw(st.integers(min_value=0, max_value=4)) for _ in range(rank)]
     return tuple(dims)
 
 
 @st.composite
-def float_tensor(draw) -> Tensor:
+def float_tensor(draw: st.DrawFn) -> Tensor:
     """Generate a float32 tensor with small rank and side lengths.
 
     Values are bounded to avoid inf/nan.
@@ -182,16 +182,18 @@ def float_tensor(draw) -> Tensor:
     if numel == 0:
         return torch.empty(shape, dtype=torch.float32)
 
-    vals = draw(st.lists(
-        st.floats(-1000.0, 1000.0, allow_nan=False, allow_infinity=False),
-        min_size=numel,
-        max_size=numel,
-    ))
+    vals = draw(
+        st.lists(
+            st.floats(-1000.0, 1000.0, allow_nan=False, allow_infinity=False),
+            min_size=numel,
+            max_size=numel,
+        )
+    )
     return torch.tensor(vals, dtype=torch.float32).view(shape)
 
 
 @st.composite
-def float_state_dicts(draw) -> StateDict:
+def float_state_dicts(draw: st.DrawFn) -> StateDict:
     """Generate an OrderedDict[str, Tensor] with 1-5 float32 tensors.
 
     We keep these float-only for property tests, because mutation + int dtypes

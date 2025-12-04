@@ -9,14 +9,17 @@ import socket
 import threading
 from dataclasses import asdict
 from functools import wraps
-from typing import Any, Callable, Generic, Optional, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, ParamSpec, TypeVar
 
 import torch
 import torch.distributed as dist
+import wandb
 from torch.multiprocessing import get_context, spawn
 
-import wandb
 from fedmat import install_exception_handlers, install_global_log_context, set_log_context
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +48,7 @@ class ReinitOfSingleton(Exception):
 class Singleton(Generic[T], type):
     """Metaclass to enforce a per‑process singleton."""
 
-    _instance: Optional[T] = None
+    _instance: T | None = None
     _lock: threading.Lock = threading.Lock()
 
     def __call__(cls, *args: Any, **kwargs: Any) -> T:
@@ -87,7 +90,7 @@ class DistributedContext(metaclass=Singleton["DistributedContext"]):
         self.device = torch.device("cpu")
         self._initialized = False
         self._is_spawn_parent = False
-        self._wandb_run: Optional[wandb.sdk.wandb_run.Run] = None
+        self._wandb_run: wandb.sdk.wandb_run.Run | None = None
 
     @property
     def is_distributed(self) -> bool:
@@ -320,7 +323,7 @@ class DistributedContext(metaclass=Singleton["DistributedContext"]):
             dir=str(cfg.output_dir),
         )
 
-    def wandb_log(self, data: dict[str, Any], step: Optional[int] = None) -> None:
+    def wandb_log(self, data: dict[str, Any], step: int | None = None) -> None:
         """Log scalars to wandb on the main rank."""
         if self.is_main_process and self._wandb_run is not None:
             self._wandb_run.log(data, step=step)

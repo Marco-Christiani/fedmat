@@ -82,8 +82,8 @@ def permute_vit_layer_heads(layer: ViTLayer, perm: Tensor) -> None:
     >>> for layer in model.vit.encoder.layer:
     ...     permute_vit_layer_heads(layer, perm)
     """
-    sa = layer.attention.attention  # ViTSelfAttention
-    so = layer.attention.output  # ViTSelfOutput
+    sa = layer.attention.attention
+    so = layer.attention.output
 
     n_head = sa.num_attention_heads
     hd = sa.attention_head_size

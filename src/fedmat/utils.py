@@ -8,7 +8,9 @@ from typing import Any, TypeVar
 
 import numpy as np
 import torch
+from torch import nn
 from transformers import ViTConfig, ViTForImageClassification
+from transformers.models.vit.modeling_vit import ViTLayer
 
 T = TypeVar("T", bound=Mapping[str, Any])
 
@@ -59,6 +61,12 @@ def get_amp_settings(
     if device.type == "cuda" and enable_bf16:
         return True, torch.bfloat16
     return False, torch.float32
+
+
+def as_vit_layer(layer: nn.Module) -> ViTLayer:
+    """Make sure layer is a ViTlayer."""
+    assert isinstance(layer, ViTLayer)
+    return layer
 
 
 def create_vit_classifier(
