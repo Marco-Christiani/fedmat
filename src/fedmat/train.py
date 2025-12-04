@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from . import install_exception_handlers, install_global_log_context, set_log_context, utils
-from .data import Batch, build_dataloaders, load_cifar10_subsets
+from .data import Batch, build_dataloaders, load_named_dataset_subsets
 from .distributed_context import DistributedContext
 from .evaluate import evaluate
 from .permute import permute_vit_layer_heads
@@ -535,7 +535,8 @@ def _main_local(cfg: TrainConfig, ctx: DistributedContext) -> float:
     device = ctx.device
     logger.info("Using device: %s", device)
 
-    train_ds, eval_ds = load_cifar10_subsets(
+    train_ds, eval_ds = load_named_dataset_subsets(
+        cfg.dataset,
         max_train_samples=cfg.max_train_samples,
         max_eval_samples=cfg.max_eval_samples,
     )
@@ -657,7 +658,8 @@ def _main_federated(cfg: TrainConfig, ctx: DistributedContext) -> float | None:
     device = ctx.device
     logger.info("Using device: %s (rank %d/%d)", device, ctx.rank, ctx.world_size)
 
-    train_ds, eval_ds = load_cifar10_subsets(
+    train_ds, eval_ds = load_named_dataset_subsets(
+        cfg.dataset,
         max_train_samples=cfg.max_train_samples,
         max_eval_samples=cfg.max_eval_samples,
     )
