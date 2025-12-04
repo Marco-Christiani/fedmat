@@ -241,14 +241,32 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
                 elapsed_s,
             )
 
+
         # Aggregate client models into a new global state
+        if train_config.enable_timing:
+            start_time = time.perf_counter()
         client_states = [client_model.state_dict() for client_model in client_models]
+        if train_config.enable_timing:
+            elapsed_s = time.perf_counter() - start_time
+            logger.info(
+                "Round %d communication time: %.3f s",
+                round_idx + 1,
+                elapsed_s
+            )
+            start_time = time.perf_counter()
         aggregated_state = aggregate_models(
             client_states,
             model.config,
             device=device,
             matcher=train_config.matcher,
         )
+        if train_config.enable_timing:
+            elapsed_s = time.perf_counter() - start_time
+            logger.info(
+                "Round %d aggregation time: %.3f s",
+                round_idx + 1,
+                elapsed_s
+            )
 
         # Canonicalize model weights via flat + unflat and load
         flat = reshaper.flatten(aggregated_state)
