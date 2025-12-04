@@ -7,7 +7,6 @@ run_name:
 seed: 42
 model_name: google/vit-base-patch16-224-in21k
 use_pretrained: true
-num_labels: 10
 learning_rate: 5e-4
 weight_decay: 0.01
 batch_size: 16
@@ -32,3 +31,4 @@ matcher: null
 
 enable_timing: true
 dry: false
+dataset: cifar10

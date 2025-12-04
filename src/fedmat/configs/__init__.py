@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -50,3 +50,5 @@ class TrainConfig:
 
     enable_timing: bool = False
     dry: bool = False
+
+    dataset: Literal["cifar10", "imagenet1k"]
