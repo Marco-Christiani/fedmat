@@ -1,853 +1,339 @@
-"""Training utilities for vision transformer models on federated data."""
+"""FedMAT train experiments that packs local client training onto a GPU w streams."""
 
 from __future__ import annotations
 
-import json
+import copy
 import logging
-import math
-from collections import defaultdict
-from dataclasses import dataclass, replace
-from datetime import datetime
+import time
 from pathlib import Path
-from pprint import pformat
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Iterator, TypedDict
 
 import hydra
-import matplotlib.pyplot as plt
-import numpy as np
+import polars as pl
 import torch
-from hydra.core.hydra_config import HydraConfig
-from hydra.utils import instantiate, to_absolute_path
+from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
-from torch import Tensor
-from tqdm.auto import tqdm
-from transformers import AutoImageProcessor, ViTConfig, ViTForImageClassification
+from transformers import AutoImageProcessor, ViTForImageClassification
 
-from . import install_exception_handlers, install_global_log_context, set_log_context, utils
-from .data import Batch, build_dataloaders, load_named_dataset_subsets
-from .distributed_context import DistributedContext
-from .evaluate import evaluate
-from .permute import permute_vit_layer_heads
-from .train_utils import ModelFlatMetadata, StateDict, flatten_state_dict, unflatten_state_dict
-from .utils import create_vit_classifier, get_amp_settings, set_seed
+from fedmat import install_exception_handlers, install_global_log_context, set_log_context
+from fedmat.data import Batch, build_dataloaders, load_cifar10_subsets
+from fedmat.evaluate import evaluate
+from fedmat.train import aggregate_models
+from fedmat.train_utils import ModelReshaper, clone_state_dict, log_run_artifacts
+from fedmat.utils import create_vit_classifier, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
-    from torch.utils.data import DataLoader
-    from transformers.models.vit.modeling_vit import ViTLayer
-
     from .configs import TrainConfig
-    from .matching import Matcher
 
 logger = logging.getLogger(__name__)
 
 
-class MetricRecord(TypedDict):
-    """Metric record for a training step."""
+class MetricRow(TypedDict):
+    """Flat, typed metric record for federated serial training."""
 
-    epoch: int
+    round: int
+    client: int
+    step: int  # local step index within round for this client
     global_step: int
-    step: int
     loss: float
 
 
-Metrics = list[MetricRecord]
+def _select_device() -> torch.device:
+    """Select the best available device for serial training."""
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
+        return torch.device("cuda:0")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
-@dataclass
-class TrainingMetadata:
-    """Training metadata across epochs for logging purposes."""
+import contextlib
 
-    global_step: int = 0
-    best_loss: float = float("inf")
 
-
-def _resolve_config_paths(config: TrainConfig) -> TrainConfig:
-    """Resolve all relative paths within the config."""
-    raw_output_dir = Path(config.output_dir)
-    output_dir = Path(to_absolute_path(raw_output_dir.as_posix()))
-    return replace(config, output_dir=output_dir)
-
-
-def _initialize_server_and_matcher(
-    cfg: TrainConfig,
-    model: ViTForImageClassification,
-    ctx: DistributedContext,
-) -> tuple[ViTForImageClassification | None, Matcher | None]:
-    """Initialize server model (on rank 0) and matcher."""
-    matcher = cfg.matcher
-    server_model: ViTForImageClassification | None = None
-    if ctx.is_main_process:
-        server_model = create_vit_classifier(
-            model_name=cfg.model_name,
-            num_labels=cfg.num_labels,
-            use_pretrained=cfg.use_pretrained,
-        )
-        cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
-        server_model.load_state_dict(cpu_state)
-        server_model.to("cpu")
-    return server_model, matcher
-
-
-def _broadcast_initial_state(
-    model: ViTForImageClassification,
-    server_model: ViTForImageClassification | None,
-    ctx: DistributedContext,
-) -> torch.Tensor:
-    """Broadcast initial global model from server (rank 0) to all clients using flattened weights."""
-    flat = ctx.flatten_model(model)
-    flat = ctx.broadcast_tensor(flat, src=0)
-    ctx.unflatten_model(model, flat)
-    metadata = ctx.metadata
-    assert metadata is not None
-    if server_model is not None:
-        server_model.load_state_dict(unflatten_state_dict(flat, metadata))
-    return flat
-
-
-def _compute_mean_loss(metrics: Metrics) -> float | None:
-    """Return the mean loss from a list of metric records.
-
-    This is dumb.
-    """
-    if not metrics:
-        return None
-    losses = [rec["loss"] for rec in metrics if math.isfinite(rec["loss"])]
-    if not losses:
-        return None
-    return float(sum(losses) / len(losses))
-
-
-def _aggregate_and_evaluate_round(
-    cfg: TrainConfig,
-    server_model: ViTForImageClassification | None,
-    matcher: Matcher | None,
-    eval_dataloader: DataLoader[Batch],
-    ctx: DistributedContext,
-    gathered: list[torch.Tensor],
-    metadata: ModelFlatMetadata,
-    round_idx: int,
-    server_best_accuracy: float,
-    global_step: int,
-    round_train_loss: float | None,
-) -> tuple[torch.Tensor, float | None, torch.Tensor | None, float]:
-    """Aggregate client models on rank 0, evaluate, and log artifacts."""
-    aggregated_flat = torch.zeros_like(gathered[0])
-    final_accuracy: float | None = None
-    final_confmat: torch.Tensor | None = None
-
-    if ctx.is_main_process:
-        assert server_model is not None
-        state_dicts = [unflatten_state_dict(vec, metadata) for vec in gathered]
-        logger.info("Aggregating %d client models on rank 0 (round %d)", len(state_dicts), round_idx + 1)
-        aggregated_state = aggregate_models(
-            state_dicts,
-            server_model.config,
-            device=ctx.device,
-            matcher=matcher,
-        )
-        aggregated_flat = flatten_state_dict(aggregated_state, metadata)
-        server_model.load_state_dict(aggregated_state)
-
-        server_model.to(ctx.device)
-        acc, conf = evaluate(server_model, eval_dataloader, ctx.device, enable_bf16=cfg.use_bf16)
-        server_model.to("cpu")
-
-        final_accuracy = float(acc)
-        final_confmat = conf
-
-        now = datetime.now().isoformat(timespec="seconds")
-        server_ckpt = cfg.output_dir / f"server_model-round{round_idx + 1}-{now}.pt"
-        torch.save(server_model.state_dict(), server_ckpt)
-        logger.info(
-            "Server eval after round %d: accuracy=%.4f; checkpoint saved to %s",
-            round_idx + 1,
-            final_accuracy,
-            server_ckpt,
-        )
-
-        if conf is not None:
-            conf_path = cfg.output_dir / f"server_confusion-round{round_idx + 1}-{now}.pt"
-            torch.save(conf.cpu(), conf_path)
-            logger.info("Confusion matrix saved to %s", conf_path)
-
-        if final_accuracy > server_best_accuracy:
-            server_best_accuracy = final_accuracy
-            best_ckpt_path = cfg.output_dir / "best-server.pt"
-            torch.save(server_model.state_dict(), best_ckpt_path)
-            logger.info("New best server model (acc=%.4f) saved to %s", server_best_accuracy, best_ckpt_path)
-            ctx.wandb_log_artifact("best-server-model", best_ckpt_path)
-
-        log_payload = {
-            "round/number": round_idx + 1,
-            "round/server_accuracy": final_accuracy,
-            "round/server_best_accuracy": server_best_accuracy,
-        }
-        if round_train_loss is not None:
-            log_payload["round/server_train_loss"] = round_train_loss
-
-        ctx.wandb_log(log_payload, step=global_step)
-
-    aggregated_flat = ctx.broadcast_tensor(aggregated_flat, src=0)
-    return aggregated_flat, final_accuracy, final_confmat, server_best_accuracy
-
-
-def _save_federated_artifacts(
-    cfg: TrainConfig,
-    model: ViTForImageClassification,
-    final_confmat: torch.Tensor | None,
-    metrics: dict,
-) -> None:
-    """Save metrics, confusion matrix, and final client model for federated runs."""
-    now = datetime.now().isoformat(timespec="seconds")
-
-    metrics_path = cfg.output_dir / f"metrics-{now}.json"
-    logger.info("Saving metrics to %s", metrics_path)
-    with metrics_path.open("w") as f:
-        json.dump(metrics, fp=f, indent=2)
-
-    if final_confmat is not None:
-        conf_path = cfg.output_dir / f"confusion_matrix-{now}.pt"
-        logger.info("Saving final confusion matrix to %s", conf_path)
-        torch.save(final_confmat.cpu(), conf_path)
-
-    ckpt_path = cfg.output_dir / f"model-{now}.pt"
-    logger.info("Saving final local model checkpoint to %s", ckpt_path)
-    torch.save(model.state_dict(), ckpt_path)
-
-
-def _build_client_models(
-    state_dicts: list[StateDict],
-    template_config: ViTConfig,
-) -> list[ViTForImageClassification]:
-    """Instantiate client models on CPU from state dicts."""
-    client_models: list[ViTForImageClassification] = []
-    for sd in state_dicts:
-        model = ViTForImageClassification(template_config)
-        model.load_state_dict(sd)
-        model.to("cpu")
-        client_models.append(model)
-    return client_models
-
-
-def _aggregate_encoder_layers(
-    client_models: list[ViTForImageClassification],
-    device: torch.device,
-    matcher: Matcher | None,
-) -> StateDict:
-    """Aggregate encoder layers with optional head matching."""
-    aggregated_state = StateDict()
-
-    reference_model = client_models[0]
-    num_layers = len(reference_model.vit.encoder.layer)
-
-    with torch.no_grad():
-        for layer_idx in range(num_layers):
-            client_layers: list[ViTLayer] = [model.vit.encoder.layer[layer_idx] for model in client_models]
-
-            for layer in client_layers:
-                layer.to(device)
-
-            if matcher is not None:
-                perms = matcher.match(client_layers)
-                for layer, perm in zip(client_layers, perms):
-                    permute_vit_layer_heads(layer, perm)
-
-            param_maps = [dict(layer.named_parameters()) for layer in client_layers]
-            reference_param_map = param_maps[0]
-
-            for name, reference_param in reference_param_map.items():
-                full_name = f"vit.encoder.layer.{layer_idx}.{name}" if name else f"vit.encoder.layer.{layer_idx}"
-                tensors = [param_map[name].data.float() for param_map in param_maps]
-                stacked = torch.stack(tensors, dim=0)
-                avg = stacked.mean(dim=0).to(reference_param.dtype).cpu()
-                aggregated_state[full_name] = avg
-
-            buffer_maps = [dict(layer.named_buffers()) for layer in client_layers]
-            if buffer_maps:
-                reference_buffer_map = buffer_maps[0]
-                for name, reference_buffer in reference_buffer_map.items():
-                    full_name = f"vit.encoder.layer.{layer_idx}.{name}" if name else f"vit.encoder.layer.{layer_idx}"
-                    if torch.is_floating_point(reference_buffer):
-                        tensors = [buffer_map[name].data.float() for buffer_map in buffer_maps]
-                        stacked = torch.stack(tensors, dim=0)
-                        avg = stacked.mean(dim=0).to(reference_buffer.dtype).cpu()
-                        aggregated_state[full_name] = avg
-                    else:
-                        aggregated_state[full_name] = reference_buffer.detach().cpu().clone()
-
-            for layer in client_layers:
-                layer.to("cpu")
-
-    return aggregated_state
-
-
-def _aggregate_remaining_parameters(
-    client_models: list[ViTForImageClassification],
-    aggregated_state: StateDict,
-    device: torch.device,
-) -> StateDict:
-    """Aggregate all non-encoder parameters and buffers."""
-    client_state_dicts = [model.state_dict() for model in client_models]
-    reference_state_dict = client_state_dicts[0]
-
-    with torch.no_grad():
-        for name, reference_tensor in reference_state_dict.items():
-            if name in aggregated_state:
-                continue
-
-            if torch.is_floating_point(reference_tensor):
-                stacked = torch.stack(
-                    [sd[name].to(device=device, dtype=torch.float32) for sd in client_state_dicts],
-                    dim=0,
-                )
-                avg = stacked.mean(dim=0).to(reference_tensor.dtype).cpu()
-                aggregated_state[name] = avg
-            else:
-                aggregated_state[name] = reference_tensor.detach().clone()
-
-    return aggregated_state
-
-
-def aggregate_models(
-    state_dicts: list[StateDict],
-    template_config: ViTConfig,
-    device: torch.device,
-    matcher: Matcher | None = None,
-) -> StateDict:
-    """Aggregate client ViT models with per-layer matched averaging."""
-    client_models = _build_client_models(state_dicts, template_config)
-    aggregated_state = _aggregate_encoder_layers(client_models, device, matcher)
-    return _aggregate_remaining_parameters(client_models, aggregated_state, device)
-
-
-def train_epoch(
-    model: ViTForImageClassification,
-    dataloader: DataLoader[Batch],
-    device: torch.device,
-    train_config: TrainConfig,
-    ctx: DistributedContext | None,
-    training_metadata: TrainingMetadata,
-    epoch_metadata: dict | None = None,
-    epoch_name: str = "",
-) -> Metrics:
-    """Train model for one epoch.
-
-    Parameters
-    ----------
-    model : ViTForImageClassification
-        Vision Transformer model to train
-    dataloader : DataLoader[Batch]
-        Training data loader
-    device : torch.device
-        Device to train on
-    cfg : TrainConfig
-        Training configuration
-    training_metadata : TrainingMetadata
-        Metadata tracked across epochs
-    epoch_metadata : dict | None, optional
-        Metadata for this epoch, by default None
-    epoch_name : str, optional
-        Name for progress bar, by default ""
-
-    Returns
-    -------
-    list[MetricRecord]
-        Metric records.
-    """
-    if epoch_metadata is None:
-        epoch_metadata = {}
-    model.train()
-
-    optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=train_config.learning_rate,
-        weight_decay=train_config.weight_decay,
-    )
-
-    use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
-
-    n_batches = len(dataloader)
-
-    metrics_loss_gpu: Tensor = torch.empty(
-        n_batches,
-        dtype=torch.float32,
-        device=device,
-    )
-
-    metrics_meta: list[MetricRecord] = []  # cpu
-
-    try:
-        running_loss_gpu: Tensor = torch.zeros((), device=device)
-        steps_since_log = 0
-
-        progress = tqdm(dataloader, desc=epoch_name) if (ctx and ctx.is_main_process) else dataloader
-
-        for step, batch in enumerate(progress):
-            training_metadata.global_step += 1
-            steps_since_log += 1
-
-            pixel_values = batch["pixel_values"].to(device)
-            labels = batch["labels"].to(device)
-
-            with torch.autocast(
-                device_type=device.type,
-                dtype=amp_dtype,
-                enabled=use_autocast,
-            ):
-                outputs = model(
-                    pixel_values=pixel_values,  # (B, C, H, W)
-                    labels=labels,  # (B,)
-                )
-                loss = outputs.loss
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-
-            if train_config.max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.max_grad_norm)
-
-            optimizer.step()
-
-            metrics_loss_gpu[step] = loss.detach()
-            metrics_meta.append({
-                **epoch_metadata,
-                "step": step,
-                "global_step": training_metadata.global_step,
-                "loss": float("nan"),  # placeholder
-            })
-
-            running_loss_gpu += loss.detach()
-            if training_metadata.global_step % train_config.log_every_n_steps == 0 or step == len(dataloader) - 1:
-                avg_loss_gpu = running_loss_gpu / steps_since_log
-                avg_loss = float(avg_loss_gpu.item())
-
-                if hasattr(progress, "set_postfix"):
-                    progress.set_postfix(loss=f"{avg_loss:.4f}")
-
-                # NOTE: ONLY MAIN rank logs metrics rn...
-                # ctx should NEVER be done this is stupid mistake an against the design
-                if ctx:
-                    ctx.wandb_log(
-                        {
-                            **{f"train/{k}": v for k, v in epoch_metadata.items()},
-                            "train/loss": avg_loss,
-                            "train/best_loss": training_metadata.best_loss,
-                            "train/step": step,
-                            "train/global_step": training_metadata.global_step,
-                            "train/lr": optimizer.param_groups[0]["lr"],
-                        },
-                        step=training_metadata.global_step,
-                    )
-
-                # NOTE: ONLY MAIN rank checkpoints main writes best rn should instead put the rank in,
-                #   the filename i guess and have them all log
-                if avg_loss < training_metadata.best_loss:
-                    training_metadata.best_loss = avg_loss
-
-                    if ctx is None or ctx.is_main_process:
-                        ckpt_path = train_config.output_dir / "best.pt"
-                        torch.save(
-                            {
-                                **epoch_metadata,
-                                "model": model.state_dict(),
-                                "optimizer": optimizer.state_dict(),
-                                "global_step": training_metadata.global_step,
-                            },
-                            ckpt_path,
-                        )
-
-                    if ctx is not None and train_config.save_round_checkpoints:
-                        ctx.wandb_log_artifact("best-model", ckpt_path)
-
-                # reset local running stats
-                running_loss_gpu.zero_()
-                steps_since_log = 0
-
-    finally:
-        # sync and fill
-        loss_list_cpu = metrics_loss_gpu.cpu().tolist()
-        for rec in metrics_meta:
-            rec["loss"] = loss_list_cpu[rec["step"]]
-
-    return metrics_meta
-
-
-def train(
-    *,
-    model: ViTForImageClassification,
-    dataloader: DataLoader[Batch],
-    device: torch.device,
-    cfg: TrainConfig,
-    ctx: DistributedContext | None,
-    training_metadata: TrainingMetadata | None = None,
-) -> Metrics:
-    """Train model for multiple epochs.
-
-    Parameters
-    ----------
-    model : ViTForImageClassification
-        Vision Transformer model to train
-    dataloader : DataLoader[Batch]
-        Training data loader
-    device : torch.device
-        Device to train on
-    cfg : TrainConfig
-        Training configuration
-    ctx : DistributedContext | None
-        Distributed logging / comms context
-    training_metadata : TrainingMetadata | None
-        If provided, global_step and best_loss will be shared across calls.
-        If None, a fresh metadata object is created for this call.
-
-    Returns
-    -------
-    Metrics
-        List of metric records for all training steps
-    """
-    if training_metadata is None:
-        training_metadata = TrainingMetadata()
-
-    epoch_name_padding = " " * len(str(cfg.epochs))
-    metrics: Metrics = []
-    for epoch in range(cfg.epochs):
-        epoch_padded = epoch_name_padding + str(epoch)
-        epoch_metrics = train_epoch(
-            model,
-            dataloader,
-            device,
-            cfg,
-            ctx,
-            training_metadata=training_metadata,
-            epoch_metadata={"epoch": epoch},
-            epoch_name=f"Epoch {epoch_padded}/{cfg.epochs}",
-        )
-        metrics.extend(epoch_metrics)
-
-    if ctx is not None and ctx.is_main_process:
-        ctx.wandb_update_summary("final/loss", metrics[-1]["loss"])
-        ctx.wandb_update_summary("best/loss", training_metadata.best_loss)
-    return metrics
-
-
-def _main_local(cfg: TrainConfig, ctx: DistributedContext) -> float:
-    """Run local (single-process) training."""
-    device = ctx.device
+def _run_fed_training(train_config: TrainConfig) -> float | None:
+    """Execute the federated training loop with per-step multi-client scheduling."""
+    device = _select_device()
     logger.info("Using device: %s", device)
 
-    train_ds, eval_ds = load_named_dataset_subsets(
-        cfg.dataset,
-        max_train_samples=cfg.max_train_samples,
-        max_eval_samples=cfg.max_eval_samples,
+    train_ds, eval_ds = load_cifar10_subsets(
+        max_train_samples=train_config.max_train_samples,
+        max_eval_samples=train_config.max_eval_samples,
     )
-
-    image_processor = AutoImageProcessor.from_pretrained(cfg.model_name)
-
-    model: ViTForImageClassification = create_vit_classifier(
-        model_name=cfg.model_name,
-        num_labels=cfg.num_labels,
-        use_pretrained=cfg.use_pretrained,
-    )
-
-    logger.info("Model:\n%s", pformat(model))
-
-    _ = model.to(device)
-
-    if cfg.use_torch_compile:
-        model.compile()
+    image_processor = AutoImageProcessor.from_pretrained(train_config.model_name)
 
     client_dataloaders, eval_dataloader = build_dataloaders(
         train_ds=train_ds,
-        homogeneity=cfg.homogeneity,
-        num_clients=cfg.num_clients,
+        homogeneity=train_config.homogeneity,
+        num_clients=train_config.num_clients,
         eval_ds=eval_ds,
         image_processor=image_processor,
-        batch_size=cfg.batch_size,
-        num_workers=cfg.num_workers,
-        prefetch_factor=cfg.prefetch_factor,
+        batch_size=train_config.batch_size,
+        num_workers=train_config.num_workers,
+        prefetch_factor=train_config.prefetch_factor,
         device=device,
     )
-    train_dataloader = client_dataloaders[0]
-
-    # Train
-    training_metadata = TrainingMetadata()
-    metrics_train = train(
-        model=model,
-        dataloader=train_dataloader,
-        device=device,
-        cfg=cfg,
-        ctx=ctx,
-        training_metadata=training_metadata,
-    )
-    metrics = defaultdict(dict)
-    metrics["train"] = utils.aos_to_soa(metrics_train)
-
-    # Eval
-    accuracy, confmat = evaluate(model, eval_dataloader, device, enable_bf16=cfg.use_bf16)
-    metrics["eval"]["accuracy"] = accuracy
-
-    # Save
-    now = datetime.now().isoformat()
-
-    fpath = cfg.output_dir.joinpath(f"metrics-{now}.json")
-    logger.info("Saving metrics: %s", fpath)
-    with fpath.open("w") as f:
-        json.dump(metrics, fp=f, indent=2)
-
-    fpath = cfg.output_dir / f"confusion_matrix-{now}.pt"
-    logger.info("Saving confusion matrix data to %s", fpath)
-    torch.save(confmat.cpu(), fpath)
-    # Create a static matplotlib PNG of the confusion matrix and upload as an artifact
-    try:
-        cm = confmat.cpu().numpy()
-        fig, ax = plt.subplots(figsize=(8, 8))
-        im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
-        ax.figure.colorbar(im, ax=ax)
-
-        classes = list(range(cfg.num_labels))
-        ax.set(
-            xticks=np.arange(len(classes)),
-            yticks=np.arange(len(classes)),
-            xticklabels=classes,
-            yticklabels=classes,
-            ylabel="True label",
-            xlabel="Predicted label",
-            title="Confusion matrix",
-        )
-        plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-
-        # annotate cells
-        fmt = "d"
-        thresh = cm.max() / 2.0 if cm.size else 0.0
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                ax.text(
-                    j,
-                    i,
-                    format(int(cm[i, j]), fmt),
-                    ha="center",
-                    va="center",
-                    color="white" if cm[i, j] > thresh else "black",
-                )
-
-        fig.tight_layout()
-        img_path = cfg.output_dir / f"confusion_matrix-{now}.png"
-        fig.savefig(img_path, dpi=150)
-        plt.close(fig)
-
-        if ctx.is_main_process:
-            # log the PNG as an artifact so it appears in the run files
-            ctx.wandb_log_artifact("confusion-matrix", img_path, artifact_type="visualization")
-    except Exception:
-        logger.exception("Failed to create/save confusion matrix figure")
-
-    ckpt_path = cfg.output_dir / f"model-{now}.pt"
-    logger.info("Saving checkpoint to %s", ckpt_path)
-    torch.save(model.state_dict(), ckpt_path)
-
-    logger.info("Evaluation accuracy: %.4f", accuracy)
-    if ctx.is_main_process:
-        ctx.wandb_update_summary("eval/accuracy", accuracy)
-        if cfg.save_final_checkpoint:
-            ctx.wandb_log_artifact("final-model", ckpt_path)
-
-    return float(accuracy)
-
-
-def _main_federated(cfg: TrainConfig, ctx: DistributedContext) -> float | None:
-    """Run distributed FedAvg-style training using flattened tensor collectives."""
-    device = ctx.device
-    logger.info("Using device: %s (rank %d/%d)", device, ctx.rank, ctx.world_size)
-
-    train_ds, eval_ds = load_named_dataset_subsets(
-        cfg.dataset,
-        max_train_samples=cfg.max_train_samples,
-        max_eval_samples=cfg.max_eval_samples,
-    )
-    image_processor = AutoImageProcessor.from_pretrained(cfg.model_name)
-
-    if cfg.use_pretrained:
-        logger.info("Using pretrained backbone '%s'", cfg.model_name)
-    else:
-        logger.info("Training from scratch")
 
     model: ViTForImageClassification = create_vit_classifier(
-        model_name=cfg.model_name,
-        num_labels=cfg.num_labels,
-        use_pretrained=cfg.use_pretrained,
+        model_name=train_config.model_name,
+        num_labels=train_config.num_labels,
+        use_pretrained=train_config.use_pretrained,
     )
     model.to(device)
-    if cfg.use_torch_compile:
+    if train_config.use_torch_compile:
         model.compile()
 
-    client_dataloaders, eval_dataloader = build_dataloaders(
-        train_ds=train_ds,
-        homogeneity=cfg.homogeneity,
-        num_clients=cfg.num_clients,
-        eval_ds=eval_ds,
-        image_processor=image_processor,
-        batch_size=cfg.batch_size,
-        num_workers=cfg.num_workers,
-        prefetch_factor=cfg.prefetch_factor,
-        device=device,
-    )
-    train_dataloader = client_dataloaders[ctx.rank]
+    # Flatten metadata from the server model once
+    # metadata = build_flat_metadata(model.state_dict())
+    reshaper = ModelReshaper()
 
-    server_model, matcher = _initialize_server_and_matcher(cfg, model, ctx)
-    metadata = ctx.ensure_metadata(model)
-    _broadcast_initial_state(model, server_model, ctx)
-    # >>> NEW DEBUG BLOCK STARTS HERE <<<
-    # import hashlib
-    # Build a deterministic hash of the metadata.names sequence on each rank
-    # names_bytes = "|".join(metadata.names).encode("utf-8")
-    # local_hash_int = int.from_bytes(
-    #     hashlib.sha256(names_bytes).digest()[:8], byteorder="big", signed=False
-    # )
-    # local_hash_tensor = torch.tensor(local_hash_int, dtype=torch.int64, device="cpu")
-
-    import hashlib, torch
-
-    names_bytes = "|".join(metadata.names).encode()
-    h = hashlib.sha256(names_bytes).digest()[:8]
-    i = int.from_bytes(h, "big", signed=False)
-
-    # safe signed int64
-    local_hash_tensor = torch.tensor(i & 0x7FFFFFFFFFFFFFFF, dtype=torch.int64)
-
-    hash_tensors = ctx.all_gather_tensor(local_hash_tensor)
-    if ctx.is_main_process:
-        hash_vals = [int(t.item()) for t in hash_tensors]
-        logger.info("Per-rank metadata hash: %s", hash_vals)
-        # Hard assert for debugging: if this trips, we FOUND the bug.
-        assert all(h == hash_vals[0] for h in hash_vals), "Metadata mismatch across ranks!"
-    # <<< NEW DEBUG BLOCK ENDS HERE <<<
-
-    all_train_metrics: Metrics = []
-    server_best_accuracy = float("-inf")
+    global_state = copy.deepcopy(model.state_dict())
+    global_step = 0
+    all_train_metrics: list[MetricRow] = []
     final_accuracy: float | None = None
     final_confmat: torch.Tensor | None = None
+    best_server_accuracy = float("-inf")
 
-    server_round_train_losses: list[float] = []
-    training_metadata = TrainingMetadata()
+    # set up streams if on cuda.
+    streams: list[torch.cuda.Stream | None] = [
+        torch.cuda.Stream(device=device) if device.type == "cuda" else None for _ in range(train_config.num_clients)
+    ]
 
-    for round_idx in range(cfg.num_rounds):
-        logger.info("Starting communication round %d/%d", round_idx + 1, cfg.num_rounds)
+    use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
+    logger.info("Dataset lens: %s", [len(dl) for dl in client_dataloaders])
 
-        round_metrics = train(
-            model=model,
-            dataloader=train_dataloader,
+    for round_idx in range(train_config.num_rounds):
+        logger.info(
+            "Starting round %d/%d",
+            round_idx + 1,
+            train_config.num_rounds,
+        )
+
+        # Per-round client models, optimizers, streams, and dataloader iterators
+        client_models: list[ViTForImageClassification] = []
+        client_optimizers: list[torch.optim.Optimizer] = []
+        client_iters: list[Iterator[Batch]] = []
+
+        for client_idx, dataloader in enumerate(client_dataloaders):
+            client_model = copy.deepcopy(model)  # init from current server arch
+            client_model.load_state_dict(global_state)
+            client_model.to(device)
+
+            optimizer = torch.optim.SGD(
+                client_model.parameters(),
+                lr=train_config.learning_rate,
+                weight_decay=train_config.weight_decay,
+            )
+
+            client_models.append(client_model)
+            client_optimizers.append(optimizer)
+            client_iters.append(iter(dataloader))
+
+        # Per-client running loss on device + logging counters
+        running_loss_gpu: list[torch.Tensor | None] = [None] * train_config.num_clients
+        steps_since_log: list[int] = [0] * train_config.num_clients
+
+        # Timing start
+        if train_config.enable_timing:
+            if device.type == "cuda":
+                start_evt = torch.cuda.Event(enable_timing=True)
+                end_evt = torch.cuda.Event(enable_timing=True)
+                start_evt.record()
+            else:
+                start_time = time.perf_counter()
+
+        # Local training: step-major, client-minor loop
+        for local_step in range(train_config.local_steps):
+            for client_idx in range(train_config.num_clients):
+                stream = streams[client_idx]
+                client_model = client_models[client_idx]
+                optimizer = client_optimizers[client_idx]
+                it = client_iters[client_idx]
+
+                client_model.train()
+
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    it = iter(client_dataloaders[client_idx])
+                    client_iters[client_idx] = it
+                    batch = next(it)
+
+                pixel_values = batch["pixel_values"].to(device)
+                labels = batch["labels"].to(device)
+
+                ctx = (
+                    torch.cuda.stream(stream)
+                    if (stream is not None and device.type == "cuda")
+                    else contextlib.nullcontext()
+                )
+                with ctx:
+                    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast):
+                        outputs = client_model(pixel_values=pixel_values, labels=labels)
+                        loss = outputs.loss
+
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    if train_config.max_grad_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            client_model.parameters(),
+                            train_config.max_grad_norm,
+                        )
+                    optimizer.step()
+
+                    loss_det = loss.detach()
+
+                    # Metrics and logging bookkeeping
+                    global_step += 1
+                    steps_since_log[client_idx] += 1
+
+                    # Accumulate running loss on device
+                    if running_loss_gpu[client_idx] is None:
+                        running_loss_gpu[client_idx] = loss_det
+                    else:
+                        running_loss_gpu[client_idx] = running_loss_gpu[client_idx] + loss_det
+
+                    all_train_metrics.append({
+                        "round": round_idx,
+                        "client": client_idx,
+                        "step": local_step,
+                        "global_step": global_step,
+                        "loss": float(loss_det.item()),  # sync
+                    })
+
+                    # Logging - interval or round end
+                    # do_log = (
+                    #     steps_since_log[client_idx] >= train_config.log_every_n_steps
+                    #     or local_step == train_config.local_steps - 1
+                    # )
+                    do_log = ((local_step + 1) % train_config.log_every_n_steps == 0) or (
+                        local_step == train_config.local_steps - 1
+                    )
+
+                    if do_log and running_loss_gpu[client_idx] is not None:
+                        avg_loss_gpu = running_loss_gpu[client_idx] / steps_since_log[client_idx]
+                        avg_loss = float(avg_loss_gpu.item())  # sync
+                        logger.info(
+                            "Round %d client %d local_step %d global_step %d avg_loss=%.4f",
+                            round_idx + 1,
+                            client_idx + 1,
+                            local_step,
+                            global_step,
+                            avg_loss,
+                        )
+                        running_loss_gpu[client_idx] = None
+                        steps_since_log[client_idx] = 0
+
+        # Barrier
+        for s in streams:
+            if s is not None:
+                s.synchronize()
+
+        # Timing end for local training.
+        if train_config.enable_timing:
+            if device.type == "cuda":
+                end_evt.record()
+                torch.cuda.synchronize()
+                elapsed_s = start_evt.elapsed_time(end_evt) / 1000
+            else:
+                elapsed_s = time.perf_counter() - start_time
+            logger.info(
+                "Round %d local training time: %.3f s",
+                round_idx + 1,
+                elapsed_s,
+            )
+
+        # Aggregate client models into a new global state
+        client_states = [client_model.state_dict() for client_model in client_models]
+        aggregated_state = aggregate_models(
+            client_states,
+            model.config,
             device=device,
-            cfg=cfg,
-            ctx=ctx,
-            training_metadata=training_metadata,
-        )
-        all_train_metrics.extend(round_metrics)
-        global_step = training_metadata.global_step
-
-        round_train_loss = _compute_mean_loss(round_metrics)
-        aggregated_round_loss: float | None = None
-        if round_train_loss is not None:
-            loss_tensor = torch.tensor(round_train_loss, dtype=torch.float32, device=ctx.device)
-        else:
-            loss_tensor = torch.tensor(float("nan"), dtype=torch.float32, device=ctx.device)
-        gathered_losses = ctx.all_gather_tensor(loss_tensor)
-        finite_losses = [float(t.item()) for t in gathered_losses if math.isfinite(float(t.item()))]
-        if finite_losses:
-            aggregated_round_loss = sum(finite_losses) / len(finite_losses)
-            server_round_train_losses.append(aggregated_round_loss)
-
-        local_flat = ctx.flatten_model(model)
-        gathered = ctx.all_gather_tensor(local_flat)
-
-        aggregated_flat, final_accuracy, final_confmat, server_best_accuracy = _aggregate_and_evaluate_round(
-            cfg=cfg,
-            server_model=server_model,
-            matcher=matcher,
-            eval_dataloader=eval_dataloader,
-            ctx=ctx,
-            gathered=gathered,
-            metadata=metadata,
-            round_idx=round_idx,
-            server_best_accuracy=server_best_accuracy,
-            global_step=global_step,
-            round_train_loss=aggregated_round_loss,
+            matcher=train_config.matcher,
         )
 
-        ctx.unflatten_model(model, aggregated_flat)
+        # Canonicalize model weights via flat + unflat and load
+        flat = reshaper.flatten(aggregated_state)
+        reshaper.unflatten_model(model, flat)
+        global_state = clone_state_dict(model.state_dict(), device=device)
 
-    metrics = defaultdict(dict)
-    metrics["train"] = utils.aos_to_soa(all_train_metrics)
-    if server_round_train_losses:
-        metrics["server"]["train_loss"] = server_round_train_losses
+        accuracy, confmat = evaluate(
+            model,
+            eval_dataloader,
+            device,
+            enable_bf16=train_config.use_bf16,
+        )
+        final_accuracy = float(accuracy)
+        final_confmat = confmat
 
-    if ctx.is_main_process and final_accuracy is not None:
-        metrics["eval"]["accuracy"] = final_accuracy
-        metrics["server"]["eval_accuracy"] = final_accuracy
-        _save_federated_artifacts(cfg, model, final_confmat, metrics)
-        ctx.wandb_update_summary("eval/accuracy", final_accuracy)
+        logger.info(
+            "Server eval after round %d: accuracy=%.4f",
+            round_idx + 1,
+            final_accuracy,
+        )
 
+        # Best-server checkpoint on disk in run dir
+        if final_accuracy > best_server_accuracy:
+            best_server_accuracy = final_accuracy
+            best_ckpt_path = train_config.output_dir / "best-server.pt"
+            torch.save(model.state_dict(), best_ckpt_path)
+            logger.info(
+                "New best server model (acc=%.4f) saved to %s",
+                final_accuracy,
+                best_ckpt_path,
+            )
+
+    metrics_df = pl.DataFrame(
+        all_train_metrics,
+        schema={
+            "round": pl.Int64,
+            "client": pl.Int64,
+            "step": pl.Int64,
+            "global_step": pl.Int64,
+            "loss": pl.Float64,
+        },
+    )
+
+    # Log all artifacts
+    artifacts_dir = log_run_artifacts(
+        train_config=train_config,
+        model=model,
+        metrics_df=metrics_df,
+        final_confmat=final_confmat,
+        final_accuracy=final_accuracy,
+    )
+
+    logger.info("Saved run artifacts to %s", artifacts_dir)
+    logger.info("Final evaluation accuracy: %s", final_accuracy)
     return final_accuracy
-
-
-def _driver(ctx: DistributedContext, cfg: DictConfig) -> float | None:
-    """Driver function executed per rank (and in the parent when world_size=1)."""
-    # Build the runtime config here, after Hydra main, inside this process.
-    config: TrainConfig = instantiate(cfg)
-    resolved_config = _resolve_config_paths(config)
-    resolved_config.output_dir.mkdir(parents=True, exist_ok=True)
-
-    if ctx.rank != 0:
-        for h in list(logging.getLogger().handlers):
-            if isinstance(h, logging.FileHandler):
-                logging.getLogger().removeHandler(h)
-
-    set_seed(resolved_config.seed)
-
-    ctx.wandb_init(resolved_config)
-    try:
-        if resolved_config.mode == "local":
-            return _main_local(resolved_config, ctx)
-        return _main_federated(resolved_config, ctx)
-    finally:
-        ctx.wandb_finish()
-
-
-def _get_hydra_logging_cfg() -> dict:
-    """Load Hydra's active job_logging dictConfig from the run directory."""
-    hc = HydraConfig.get()
-    hc.runtime.output_dir
-    hydra_cfg_path = Path(hc.runtime.output_dir, hc.output_subdir or ".hydra", "hydra.yaml")
-    hydra_cfg = OmegaConf.load(hydra_cfg_path)
-    job_logging_cfg = OmegaConf.to_container(hydra_cfg.hydra.job_logging, resolve=True)
-    return job_logging_cfg
 
 
 @hydra.main(config_path="configs", config_name="experiment", version_base=None)
 def main(cfg: DictConfig) -> None:
-    """Entry point for local and federated ViT training on CIFAR-10."""
+    """Hydra entry point for serial federated training."""
     install_exception_handlers(threading_=True, asyncio_=True)
-
     OmegaConf.resolve(cfg)
 
-    # Install our global logging context in the hydra parent
     install_global_log_context()
-    set_log_context(rank="main", world_size=1, backend="-")  # default until spawn workers override
+    set_log_context(rank="main", world_size=cfg.num_clients, backend="thread")
 
-    mode = cfg.mode
-    num_clients = cfg.num_clients
-    world_size = num_clients if mode == "federated" else 1
-    log_cfg = _get_hydra_logging_cfg()
+    config: TrainConfig = instantiate(cfg)
+    config.output_dir = Path(config.output_dir)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    set_seed(config.seed)
 
-    ctx = DistributedContext(world_size=world_size)
-
-    if cfg.dry:
-        logger.warning(f"Got {cfg.dry=} ending.")
+    if config.dry:
+        logger.warning("Dry run requested; exiting before training.")
         return
 
+    result: float | None = None
     try:
-        ctx.launch(_driver, cfg, log_cfg=log_cfg)
-    except BaseException:
-        logger.exception("Top-level training failure")
-        raise
+        result = _run_fed_training(config)
+    finally:
+        logger.info(
+            "Training finished with accuracy %.4f",
+            result or 0.0,
+        )
 
 
 if __name__ == "__main__":
