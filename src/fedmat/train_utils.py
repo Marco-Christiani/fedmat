@@ -9,8 +9,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Sequence
 
 import torch
-from torch import Tensor
-from torch import nn
+from torch import Tensor, nn
 
 import wandb
 from fedmat.distributed_context import DistributedContext
