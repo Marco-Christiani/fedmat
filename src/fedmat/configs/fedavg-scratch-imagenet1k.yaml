@@ -6,24 +6,28 @@ _target_: fedmat.configs.TrainConfig
 run_name:
 seed: 42
 model_name: google/vit-base-patch16-224-in21k
-use_pretrained: true
+use_pretrained: false
 learning_rate: 5e-4
 weight_decay: 0.01
-batch_size: 1
-epochs: 5
+batch_size: 64
+epochs: 2 # local epochs
 max_grad_norm:
-log_every_n_steps: 50
+log_every_n_steps: 20
 use_bf16: true
 use_torch_compile: false
-max_train_samples: 8000
-max_eval_samples: 1000
 num_workers: 4
 prefetch_factor: 4
-output_dir: ${hydra:runtime.output_dir}/vit_cifar10
 homogeneity: 1.0
-num_clients: 2
-num_rounds: 1
+num_clients: 10
+num_rounds: 10
 mode: federated
 save_round_checkpoints: false
 dry: false
-dataset: cifar10
+matcher: null
+
+dataset: imagenet1k
+num_labels: 1000
+max_train_samples: 80_000
+max_eval_samples: 10_000
+
+output_dir: ${hydra:runtime.output_dir}/vit_imagnet1k

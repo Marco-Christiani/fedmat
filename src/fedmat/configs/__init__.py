@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -44,3 +44,7 @@ class TrainConfig:
 
     mode: str
     matcher: Matcher | None
+    save_round_checkpoints: bool
+    dry: bool
+
+    dataset: Literal["cifar10", "imagenet1k"]

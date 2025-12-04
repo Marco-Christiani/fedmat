@@ -61,6 +61,7 @@ class GreedyMatcher(Matcher):
     """Greedy matching implementation."""
 
     @staticmethod
+    @torch.inference_mode()
     def match(layers: list[ViTLayer]) -> list[Tensor]:
         if len(layers) == 0:
             return []
@@ -99,6 +100,7 @@ class HungarianMatcher(Matcher):
     """Hungarian-matching implementation."""
 
     @staticmethod
+    @torch.inference_mode()
     def match(layers: list["ViTLayer"]) -> list[Tensor]:
         if len(layers) == 0:
             return []
@@ -110,23 +112,26 @@ class HungarianMatcher(Matcher):
         except StopIteration:
             device = torch.device("cpu")
 
-        ref_flat = _flatten_layer(ref_layer).to(device)
-        num_heads = ref_flat.shape[0]
+        first_layer = _flatten_layer(ref_layer).to(device)
+        num_heads = first_layer.shape[0]
 
         perms: List[Tensor] = []
         perms.append(torch.arange(num_heads, dtype=torch.long, device=device))
 
-        flattened_layers = [_flatten_layer(layer).to(device) for layer in layers]
-        for layer_index in range(1, len(layers)):
-            cli_flat = flattened_layers[layer_index]
-            cost = torch.sum(torch.stack([torch.cdist(ref_flat, cli_flat, p=2) for ref_flat in flattened_layers[:layer_index]]), dim=0)
+        previous_permuted_layers = [first_layer]
 
-            row_ind, col_ind = linear_sum_assignment(cost.numpy())
+        for layer in layers[1:]:
+            layer_flat = _flatten_layer(layer).to(device)
+            cost = torch.sum(torch.stack([torch.cdist(layer_flat, prev, p=2) for prev in previous_permuted_layers]), dim=0).detach().cpu().numpy()
+
+            row_ind, col_ind = linear_sum_assignment(cost)
             perm = torch.empty(num_heads, dtype=torch.long, device=device)
             for r, c in zip(row_ind, col_ind):
                 perm[r] = c
 
             perms.append(perm)
+            permuted_layer = layer_flat[perm]
+            previous_permuted_layers.append(permuted_layer)
 
         return perms
 

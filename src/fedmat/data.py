@@ -7,36 +7,69 @@ from collections.abc import Sized
 from typing import TYPE_CHECKING
 
 import torch
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import Dataset, load_dataset
 from torch import Tensor
 from torch.distributions import Categorical, Dirichlet
 from torch.utils.data import DataLoader, RandomSampler, Sampler
 
+from tqdm import tqdm
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from typing import Any
+    from typing import Any, Literal
 
     from transformers import AutoImageProcessor
 
 Batch = dict[str, Tensor]
 
-
-def load_cifar10_subsets(
+def _load_cifar10_subsets(
     max_train_samples: int | None,
     max_eval_samples: int | None,
-) -> tuple[Dataset, Dataset]:
-    """Load CIFAR-10 and apply optional subset selection."""
-    raw_ds = load_dataset("cifar10")
-    assert isinstance(raw_ds, DatasetDict)
+):
+    raw_ds = load_dataset("uoft-cs/cifar10", num_proc=32)
 
-    train_ds: Dataset = raw_ds["train"]
-    eval_ds: Dataset = raw_ds["test"]
+    train_ds = raw_ds["train"]
+    eval_ds = raw_ds["test"]
 
     if max_train_samples is not None:
         train_ds = train_ds.select(range(max_train_samples), keep_in_memory=True)
-
     if max_eval_samples is not None:
         eval_ds = eval_ds.select(range(max_eval_samples), keep_in_memory=True)
+
+    return train_ds, eval_ds
+
+def _load_imagenet1k_subsets(
+    max_train_samples: int | None,
+    max_eval_samples: int | None,
+):
+    raw_ds = load_dataset("ILSVRC/imagenet-1k", num_proc=32)
+
+    train_ds = raw_ds["train"].rename_column("image", "img")
+    eval_ds = raw_ds["validation"].rename_column("image", "img")
+
+    if max_train_samples is not None:
+        train_ds = train_ds.select(range(max_train_samples), keep_in_memory=True)
+    if max_eval_samples is not None:
+        eval_ds = eval_ds.select(range(max_eval_samples), keep_in_memory=True)
+
+    return train_ds, eval_ds
+
+
+def load_named_dataset_subsets(
+    dataset_name: Literal["cifar10", "imagenet1k"],
+    **kwargs,
+) -> tuple[Dataset | IterableDataset, Dataset | IterableDataset]:
+    """Load some dataset with name dataset_name and apply optional subset selection."""
+
+    if dataset_name == "cifar10":
+        train_ds, eval_ds = _load_cifar10_subsets(**kwargs)
+    elif dataset_name == "imagenet1k":
+        train_ds, eval_ds = _load_imagenet1k_subsets(**kwargs)
+    else:
+        raise ValueError(f"dataset_name must be one of 'cifar10' or 'imagenet1k', got '{dataset_name}'")
+
+    assert isinstance(train_ds, Dataset)
+    assert isinstance(eval_ds, Dataset)
 
     return train_ds, eval_ds
 
@@ -74,7 +107,7 @@ def build_dataloaders(
             **common_kwargs,
         )
         for sampler in partition_by_client(
-            (train_ds[i]["label"] for i in range(len(train_ds))),
+            (dict["label"] for dict in train_ds.select_columns("label")),
             num_clients,
             homogeneity,
         )
@@ -118,7 +151,7 @@ class Collator:
         dict[str, torch.Tensor]
             Dictionary with 'pixel_values' and 'labels' tensors
         """
-        images = [example["img"] for example in batch]
+        images = [example["img"].convert("RGB") for example in batch]
         labels_list = [int(example["label"]) for example in batch]
 
         encodings = self.image_processor(images=images, return_tensors="pt")
