@@ -143,7 +143,7 @@ def _patch_logger_add_handler(filt: logging.Filter) -> None:
     """Monkey-patch Logger.addHandler so future handlers inherit the filter."""
     orig_add_handler = logging.Logger.addHandler
 
-    def add_handler_with_patch(self, hdlr):
+    def add_handler_with_patch(self, hdlr) -> None:
         hdlr.addFilter(filt)
         if hdlr.formatter is not None:
             _patch_formatter(hdlr.formatter)

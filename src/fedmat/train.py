@@ -7,7 +7,7 @@ import copy
 import logging
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict
 
 import hydra
 import polars as pl
@@ -19,7 +19,7 @@ from transformers import AutoImageProcessor, ViTForImageClassification
 from fedmat import install_exception_handlers, install_global_log_context, set_log_context
 from fedmat.data import Batch, build_dataloaders, load_named_dataset_subsets
 from fedmat.evaluate import evaluate
-from fedmat.train_utils import ModelReshaper, StateDict, aggregate_models, clone_state_dict, log_run_artifacts
+from fedmat.train_utils import StateDict, aggregate_models, log_run_artifacts
 from fedmat.utils import create_vit_classifier, default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
@@ -73,10 +73,7 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
     if train_config.use_torch_compile:
         model.compile()
 
-    # Flatten metadata from the server model once
-    reshaper = ModelReshaper()
-
-    global_state = copy.deepcopy(model.state_dict())
+    global_state: StateDict = copy.deepcopy(model.state_dict())  # type: ignore
     global_step = 0
     all_train_metrics: list[MetricRow] = []
     final_accuracy: float | None = None
@@ -106,7 +103,7 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
         for client_idx, dataloader in enumerate(client_dataloaders):
             client_model = copy.deepcopy(model)  # init from current server arch
             client_model.load_state_dict(global_state)
-            _ = client_model.to(device=device)
+            _ = client_model.to(device=device)  # type: ignore
 
             optimizer = torch.optim.SGD(
                 client_model.parameters(),
@@ -235,25 +232,16 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
         # Aggregate client models into a new global state
         if train_config.enable_timing:
             start_time = time.perf_counter()
-        client_states = [cast("StateDict", client_model.state_dict()) for client_model in client_models]
-        if train_config.enable_timing:
-            elapsed_s = time.perf_counter() - start_time  # type: ignore
-            logger.info("Round %d communication time: %.3f s", round_idx + 1, elapsed_s)  # pyright: ignore[reportPossiblyUnboundVariable]
-            start_time = time.perf_counter()
+
         aggregated_state = aggregate_models(
-            client_states,
-            model.config,  # type: ignore
-            device=device,
+            client_models,
             matcher=train_config.matcher,
         )
+        model.load_state_dict(aggregated_state)
+        global_state = aggregated_state
         if train_config.enable_timing:
             elapsed_s = time.perf_counter() - start_time  # pyright: ignore[reportPossiblyUnboundVariable]
             logger.info("Round %d aggregation time: %.3f s", round_idx + 1, elapsed_s)
-
-        # Canonicalize model weights via flat + unflat and load
-        flat = reshaper.flatten(aggregated_state)
-        reshaper.unflatten_model(model, flat)
-        global_state = clone_state_dict(cast("StateDict", model.state_dict()), device=device)
 
         accuracy, confmat = evaluate(
             model,

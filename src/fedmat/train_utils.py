@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING
 import torch
 import wandb
 from torch import Tensor, nn
-from transformers import ViTForImageClassification
 
 from fedmat.distributed_context import DistributedContext
 from fedmat.permute import permute_vit_layer_heads
@@ -22,8 +21,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import polars as pl
-    from transformers import ViTConfig
-    from transformers.models.vit.modeling_vit import ViTLayer
+    from transformers import ViTForImageClassification
 
     from fedmat.config import TrainConfig
     from fedmat.matching import Matcher
@@ -103,7 +101,7 @@ def clone_state_dict(state_dict: StateDict, device: torch.device) -> StateDict:
 
 
 class ModelReshaper:
-    def __init__(self):
+    def __init__(self) -> None:
         self._metadata: ModelFlatMetadata | None = None
 
     @property
@@ -132,63 +130,53 @@ class ModelReshaper:
         model.load_state_dict(state)
 
 
+@torch.no_grad()
 def _aggregate_encoder_layers(
     client_models: list[ViTForImageClassification],
-    device: torch.device,
     matcher: Matcher | None,
 ) -> StateDict:
     """Aggregate encoder layers with optional head matching."""
     aggregated_state = StateDict()
-
     reference_model = client_models[0]
     num_layers = len(reference_model.vit.encoder.layer)
 
-    with torch.no_grad():
-        for layer_idx in range(num_layers):
-            client_layers: list[ViTLayer] = [
-                as_vit_layer(model.vit.encoder.layer[layer_idx]) for model in client_models
-            ]
+    for layer_idx in range(num_layers):
+        client_layers = [as_vit_layer(model.vit.encoder.layer[layer_idx]) for model in client_models]
 
-            for layer in client_layers:
-                layer.to(device)
+        if matcher is not None:
+            perms = matcher.match(client_layers)
+            for layer, perm in zip(client_layers, perms):
+                permute_vit_layer_heads(layer, perm)
 
-            if matcher is not None:
-                perms = matcher.match(client_layers)
-                for layer, perm in zip(client_layers, perms):
-                    permute_vit_layer_heads(layer, perm)
+        param_maps = [dict(layer.named_parameters()) for layer in client_layers]
+        reference_param_map = param_maps[0]
 
-            param_maps = [dict(layer.named_parameters()) for layer in client_layers]
-            reference_param_map = param_maps[0]
+        for name in reference_param_map:
+            full_name = f"vit.encoder.layer.{layer_idx}.{name}" if name else f"vit.encoder.layer.{layer_idx}"
+            tensors = [param_map[name].data for param_map in param_maps]
+            stacked = torch.stack(tensors, dim=0)
+            avg = stacked.mean(dim=0)
+            aggregated_state[full_name] = avg
 
-            for name, reference_param in reference_param_map.items():
+        buffer_maps = [dict(layer.named_buffers()) for layer in client_layers]
+        if buffer_maps:
+            reference_buffer_map = buffer_maps[0]
+            for name, reference_buffer in reference_buffer_map.items():
                 full_name = f"vit.encoder.layer.{layer_idx}.{name}" if name else f"vit.encoder.layer.{layer_idx}"
-                tensors = [param_map[name].data.float() for param_map in param_maps]
-                stacked = torch.stack(tensors, dim=0)
-                avg = stacked.mean(dim=0).to(reference_param.dtype).cpu()
-                aggregated_state[full_name] = avg
+                if torch.is_floating_point(reference_buffer):
+                    tensors = [buffer_map[name].data for buffer_map in buffer_maps]
+                    stacked = torch.stack(tensors, dim=0)
+                    avg = stacked.mean(dim=0)
+                    aggregated_state[full_name] = avg
+                else:
+                    aggregated_state[full_name] = reference_buffer.detach().clone()
 
-            buffer_maps = [dict(layer.named_buffers()) for layer in client_layers]
-            if buffer_maps:
-                reference_buffer_map = buffer_maps[0]
-                for name, reference_buffer in reference_buffer_map.items():
-                    full_name = f"vit.encoder.layer.{layer_idx}.{name}" if name else f"vit.encoder.layer.{layer_idx}"
-                    if torch.is_floating_point(reference_buffer):
-                        tensors = [buffer_map[name].data.float() for buffer_map in buffer_maps]
-                        stacked = torch.stack(tensors, dim=0)
-                        avg = stacked.mean(dim=0).to(reference_buffer.dtype).cpu()
-                        aggregated_state[full_name] = avg
-                    else:
-                        aggregated_state[full_name] = reference_buffer.detach().cpu().clone()
-
-            for layer in client_layers:
-                layer.to("cpu")
     return aggregated_state
 
 
 def _aggregate_remaining_parameters(
     client_models: list[ViTForImageClassification],
     aggregated_state: StateDict,
-    device: torch.device,
 ) -> StateDict:
     """Aggregate all non-encoder parameters and buffers."""
     client_state_dicts = [model.state_dict() for model in client_models]
@@ -200,11 +188,9 @@ def _aggregate_remaining_parameters(
                 continue
 
             if torch.is_floating_point(reference_tensor):
-                stacked = torch.stack(
-                    [sd[name].to(device=device, dtype=torch.float32) for sd in client_state_dicts],
-                    dim=0,
-                )
-                avg = stacked.mean(dim=0).to(reference_tensor.dtype).cpu()
+                tensors = [sd[name] for sd in client_state_dicts]
+                stacked = torch.stack(tensors, dim=0)
+                avg = stacked.mean(dim=0)
                 aggregated_state[name] = avg
             else:
                 aggregated_state[name] = reference_tensor.detach().clone()
@@ -212,31 +198,22 @@ def _aggregate_remaining_parameters(
     return aggregated_state
 
 
-def _build_client_models(
-    state_dicts: list[StateDict],
-    template_config: ViTConfig,
-) -> list[ViTForImageClassification]:
-    """Instantiate client models on CPU from state dicts."""
-    client_models: list[ViTForImageClassification] = []
-    for sd in state_dicts:
-        model = ViTForImageClassification(template_config)
-        model.load_state_dict(sd)
-        model.to("cpu")
-        client_models.append(model)
-    return client_models
-
-
 def aggregate_models(
-    state_dicts: list[StateDict],
-    template_config: ViTConfig,
-    device: torch.device,
+    client_models: list[ViTForImageClassification],
     matcher: Matcher | None = None,
 ) -> StateDict:
-    """Aggregate client ViT models with per-layer matched averaging."""
-    client_models = _build_client_models(state_dicts, template_config)
-    aggregated_state = _aggregate_encoder_layers(client_models, device, matcher)
-    aggregated_state = _aggregate_remaining_parameters(client_models, aggregated_state, device)
-    return aggregated_state
+    """Aggregate client ViT models with per-layer matched averaging.
+
+    Args:
+        client_models: Client models already on target device
+        matcher: Optional head matcher for encoder layers
+
+    Returns
+    -------
+        Aggregated state dict with all tensors on device, preserving native dtypes
+    """
+    aggregated_state = _aggregate_encoder_layers(client_models, matcher)
+    return _aggregate_remaining_parameters(client_models, aggregated_state)
 
 
 @DistributedContext.on_rank(0)
