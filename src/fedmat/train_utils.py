@@ -112,7 +112,7 @@ class ModelReshaper:
         """Return cached flattening metadata, creating it if needed."""
         if self._metadata is None:
             state = model_or_state.state_dict() if isinstance(model_or_state, nn.Module) else model_or_state
-            assert isinstance(state, OrderedDict)
+            assert isinstance(state, OrderedDict), f"Got {state}"
             self._metadata = build_flat_metadata(state)
         return self._metadata
 
@@ -120,7 +120,7 @@ class ModelReshaper:
         """Flatten a model or state dict."""
         metadata = self.ensure_metadata(model_or_state)
         state = model_or_state.state_dict() if isinstance(model_or_state, nn.Module) else model_or_state
-        assert isinstance(state, OrderedDict)
+        assert isinstance(state, OrderedDict), f"Got {state}"
         return flatten_state_dict(state, metadata)
 
     def unflatten_model(self, model: nn.Module, flat: torch.Tensor) -> None:
@@ -134,9 +134,9 @@ def _aggregate_encoder_layers(
     client_models: list[ViTForImageClassification],
     device: torch.device,
     matcher: Matcher | None,
-) -> dict[str, torch.Tensor]:
+) -> StateDict:
     """Aggregate encoder layers with optional head matching."""
-    aggregated_state: dict[str, torch.Tensor] = {}
+    aggregated_state = StateDict()
 
     reference_model = client_models[0]
     num_layers = len(reference_model.vit.encoder.layer)
@@ -183,9 +183,9 @@ def _aggregate_encoder_layers(
 
 def _aggregate_remaining_parameters(
     client_models: list[ViTForImageClassification],
-    aggregated_state: dict[str, torch.Tensor],
+    aggregated_state: StateDict,
     device: torch.device,
-) -> dict[str, torch.Tensor]:
+) -> StateDict:
     """Aggregate all non-encoder parameters and buffers."""
     client_state_dicts = [model.state_dict() for model in client_models]
     reference_state_dict = client_state_dicts[0]
@@ -209,7 +209,7 @@ def _aggregate_remaining_parameters(
 
 
 def _build_client_models(
-    state_dicts: list[dict[str, torch.Tensor]],
+    state_dicts: list[StateDict],
     template_config: ViTConfig,
 ) -> list[ViTForImageClassification]:
     """Instantiate client models on CPU from state dicts."""
@@ -223,11 +223,11 @@ def _build_client_models(
 
 
 def aggregate_models(
-    state_dicts: list[dict[str, torch.Tensor]],
+    state_dicts: list[StateDict],
     template_config: ViTConfig,
     device: torch.device,
     matcher: Matcher | None = None,
-) -> dict[str, torch.Tensor]:
+) -> StateDict:
     """Aggregate client ViT models with per-layer matched averaging."""
     client_models = _build_client_models(state_dicts, template_config)
     aggregated_state = _aggregate_encoder_layers(client_models, device, matcher)
