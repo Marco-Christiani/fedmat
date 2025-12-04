@@ -12,8 +12,6 @@ from torch import Tensor
 from torch.distributions import Categorical, Dirichlet
 from torch.utils.data import DataLoader, RandomSampler, Sampler
 
-from tqdm import tqdm
-
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from typing import Any, Literal
@@ -21,6 +19,7 @@ if TYPE_CHECKING:
     from transformers import AutoImageProcessor
 
 Batch = dict[str, Tensor]
+
 
 def _load_cifar10_subsets(
     max_train_samples: int | None,
@@ -37,6 +36,7 @@ def _load_cifar10_subsets(
         eval_ds = eval_ds.select(range(max_eval_samples), keep_in_memory=True)
 
     return train_ds, eval_ds
+
 
 def _load_imagenet1k_subsets(
     max_train_samples: int | None,
@@ -58,9 +58,8 @@ def _load_imagenet1k_subsets(
 def load_named_dataset_subsets(
     dataset_name: Literal["cifar10", "imagenet1k"],
     **kwargs,
-) -> tuple[Dataset | IterableDataset, Dataset | IterableDataset]:
+) -> tuple[Dataset, Dataset]:
     """Load some dataset with name dataset_name and apply optional subset selection."""
-
     if dataset_name == "cifar10":
         train_ds, eval_ds = _load_cifar10_subsets(**kwargs)
     elif dataset_name == "imagenet1k":

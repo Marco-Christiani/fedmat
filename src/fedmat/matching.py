@@ -6,9 +6,8 @@ from abc import ABC
 from typing import TYPE_CHECKING, List
 
 import torch
-from torch import Tensor, nn
-
 from scipy.optimize import linear_sum_assignment
+from torch import Tensor, nn
 
 if TYPE_CHECKING:
     from transformers.models.vit.modeling_vit import ViTLayer
@@ -31,6 +30,7 @@ class Matcher(ABC):
     def match(layers: list[ViTLayer]) -> list[Tensor]:
         """Return a permutation per client layer."""
         raise NotImplementedError("Subclasses must implement match().")
+
 
 def _flatten_layer(layer: ViTLayer) -> Tensor:
     sa = layer.attention.attention  # ViTSelfAttention
@@ -122,7 +122,12 @@ class HungarianMatcher(Matcher):
 
         for layer in layers[1:]:
             layer_flat = _flatten_layer(layer).to(device)
-            cost = torch.sum(torch.stack([torch.cdist(layer_flat, prev, p=2) for prev in previous_permuted_layers]), dim=0).detach().cpu().numpy()
+            cost = (
+                torch.sum(torch.stack([torch.cdist(layer_flat, prev, p=2) for prev in previous_permuted_layers]), dim=0)
+                .detach()
+                .cpu()
+                .numpy()
+            )
 
             row_ind, col_ind = linear_sum_assignment(cost)
             perm = torch.empty(num_heads, dtype=torch.long, device=device)
@@ -134,4 +139,3 @@ class HungarianMatcher(Matcher):
             previous_permuted_layers.append(permuted_layer)
 
         return perms
-

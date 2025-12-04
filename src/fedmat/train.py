@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import logging
 import time
@@ -16,14 +17,13 @@ from omegaconf import DictConfig, OmegaConf
 from transformers import AutoImageProcessor, ViTForImageClassification
 
 from fedmat import install_exception_handlers, install_global_log_context, set_log_context
-from fedmat.data import Batch, build_dataloaders, load_cifar10_subsets
+from fedmat.data import Batch, build_dataloaders, load_named_dataset_subsets
 from fedmat.evaluate import evaluate
-from fedmat.train import aggregate_models
-from fedmat.train_utils import ModelReshaper, clone_state_dict, log_run_artifacts
+from fedmat.train_utils import ModelReshaper, aggregate_models, clone_state_dict, log_run_artifacts
 from fedmat.utils import create_vit_classifier, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
-    from .configs import TrainConfig
+    from fedmat.config import TrainConfig
 
 logger = logging.getLogger(__name__)
 
@@ -48,15 +48,13 @@ def _select_device() -> torch.device:
     return torch.device("cpu")
 
 
-import contextlib
-
-
 def _run_fed_training(train_config: TrainConfig) -> float | None:
     """Execute the federated training loop with per-step multi-client scheduling."""
     device = _select_device()
     logger.info("Using device: %s", device)
 
-    train_ds, eval_ds = load_cifar10_subsets(
+    train_ds, eval_ds = load_named_dataset_subsets(
+        dataset_name=train_config.dataset,
         max_train_samples=train_config.max_train_samples,
         max_eval_samples=train_config.max_eval_samples,
     )

@@ -1,0 +1,41 @@
+defaults:
+  - matcher: null
+  - _self_
+
+_target_: fedmat.config.TrainConfig
+run_name:
+seed: 42
+
+model_name: google/vit-base-patch16-224-in21k
+use_pretrained: ???
+
+dataset: ???
+num_labels: ???
+max_train_samples: ???
+max_eval_samples: ???
+
+learning_rate: ???
+weight_decay: 0.01
+batch_size: ???
+local_steps: ???
+max_grad_norm: null
+
+homogeneity: 1.0
+num_clients: ???
+num_rounds: ???
+
+matcher: null
+
+log_every_n_steps: 100
+use_bf16: true
+use_torch_compile: false
+num_workers: 4
+prefetch_factor: 4
+
+save_round_checkpoints: false
+save_final_checkpoint: true
+
+output_dir: ${hydra:runtime.output_dir}
+
+enable_timing: true
+dry: false
