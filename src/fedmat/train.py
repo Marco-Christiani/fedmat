@@ -112,11 +112,10 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
             client_model.load_state_dict(global_state)
             _ = client_model.to(device=device)  # type: ignore
 
-            optimizer = torch.optim.Adam(
+            optimizer = torch.optim.SGD(
                 client_model.parameters(),
                 lr=train_config.learning_rate,
                 weight_decay=train_config.weight_decay,
-                amsgrad=True,
             )
 
             client_models.append(client_model)
