@@ -132,7 +132,7 @@ class ModelReshaper:
 @torch.no_grad()
 def _weighted_average(stacked: torch.Tensor, client_weights: torch.Tensor | None) -> torch.Tensor:
     if client_weights is None:
-        return client_weights.mean(dim=0)
+        return stacked.mean(dim=0)
     wshape = (-1,) + ((1,) * (stacked.dim() - 1))
     return (client_weights.view(wshape) * stacked).sum(dim=0)
 
