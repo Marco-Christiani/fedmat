@@ -63,6 +63,13 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
         prefetch_factor=train_config.prefetch_factor,
         device=device,
     )
+    client_dataset_lengths = [len(dl) for dl in client_dataloaders]
+    local_steps = train_config.local_steps or max(client_dataset_lengths)
+    # TODO configure this with an actual bespoke variable, don't tie everything to local_steps
+    if train_config.local_steps is None:
+        client_weights = torch.as_tensor(client_dataset_lengths).to(device) / sum(client_dataset_lengths)
+    else:
+        client_weights = None
 
     model: ViTForImageClassification = create_vit_classifier(
         model_name=train_config.model_name,
@@ -86,7 +93,7 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
     ]
 
     use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
-    logger.info("Dataset lens: %s", [len(dl) for dl in client_dataloaders])
+    logger.info("Dataset lens: %s", client_dataset_lengths)
 
     for round_idx in range(train_config.num_rounds):
         logger.info(
@@ -105,10 +112,11 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
             client_model.load_state_dict(global_state)
             _ = client_model.to(device=device)  # type: ignore
 
-            optimizer = torch.optim.SGD(
+            optimizer = torch.optim.Adam(
                 client_model.parameters(),
                 lr=train_config.learning_rate,
                 weight_decay=train_config.weight_decay,
+                amsgrad=True,
             )
 
             client_models.append(client_model)
@@ -129,21 +137,23 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
                 start_time = time.perf_counter()
 
         # Local training: step-major, client-minor loop
-        for local_step in range(train_config.local_steps):
+        for local_step in range(local_steps):
             for client_idx in range(train_config.num_clients):
                 stream = streams[client_idx]
                 client_model = client_models[client_idx]
                 optimizer = client_optimizers[client_idx]
                 it = client_iters[client_idx]
 
-                client_model.train()
-
                 try:
                     batch = next(it)
                 except StopIteration:
+                    if train_config.local_steps is None:
+                        continue
                     it = iter(client_dataloaders[client_idx])
                     client_iters[client_idx] = it
                     batch = next(it)
+
+                client_model.train()
 
                 pixel_values = batch["pixel_values"].to(device)
                 labels = batch["labels"].to(device)
@@ -193,7 +203,7 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
                     #     or local_step == train_config.local_steps - 1
                     # )
                     do_log = ((local_step + 1) % train_config.log_every_n_steps == 0) or (
-                        local_step == train_config.local_steps - 1
+                        local_step == local_steps - 1
                     )
 
                     if do_log and running_loss_gpu[client_idx] is not None:
@@ -236,6 +246,7 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
         aggregated_state = aggregate_models(
             client_models,
             matcher=train_config.matcher,
+            client_weights=client_weights,
         )
         model.load_state_dict(aggregated_state)
         global_state = aggregated_state

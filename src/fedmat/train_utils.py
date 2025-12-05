@@ -129,11 +129,18 @@ class ModelReshaper:
         state = unflatten_state_dict(flat, metadata)
         model.load_state_dict(state)
 
+@torch.no_grad()
+def _weighted_average(stacked: torch.Tensor, client_weights: torch.Tensor | None) -> torch.Tensor:
+    if client_weights is None:
+        return client_weights.mean(dim=0)
+    wshape = (-1,) + ((1,) * (stacked.dim() - 1))
+    return (client_weights.view(wshape) * stacked).sum(dim=0)
 
 @torch.no_grad()
 def _aggregate_encoder_layers(
     client_models: list[ViTForImageClassification],
     matcher: Matcher | None,
+    client_weights: torch.Tensor | None = None,
 ) -> StateDict:
     """Aggregate encoder layers with optional head matching."""
     aggregated_state = StateDict()
@@ -155,7 +162,7 @@ def _aggregate_encoder_layers(
             full_name = f"vit.encoder.layer.{layer_idx}.{name}" if name else f"vit.encoder.layer.{layer_idx}"
             tensors = [param_map[name].data for param_map in param_maps]
             stacked = torch.stack(tensors, dim=0)
-            avg = stacked.mean(dim=0)
+            avg = _weighted_average(stacked, client_weights)
             aggregated_state[full_name] = avg
 
         buffer_maps = [dict(layer.named_buffers()) for layer in client_layers]
@@ -166,7 +173,7 @@ def _aggregate_encoder_layers(
                 if torch.is_floating_point(reference_buffer):
                     tensors = [buffer_map[name].data for buffer_map in buffer_maps]
                     stacked = torch.stack(tensors, dim=0)
-                    avg = stacked.mean(dim=0)
+                    avg = _weighted_average(stacked, client_weights)
                     aggregated_state[full_name] = avg
                 else:
                     aggregated_state[full_name] = reference_buffer.detach().clone()
@@ -177,6 +184,7 @@ def _aggregate_encoder_layers(
 def _aggregate_remaining_parameters(
     client_models: list[ViTForImageClassification],
     aggregated_state: StateDict,
+    client_weights: torch.Tensor | None = None,
 ) -> StateDict:
     """Aggregate all non-encoder parameters and buffers."""
     client_state_dicts = [model.state_dict() for model in client_models]
@@ -190,7 +198,7 @@ def _aggregate_remaining_parameters(
             if torch.is_floating_point(reference_tensor):
                 tensors = [sd[name] for sd in client_state_dicts]
                 stacked = torch.stack(tensors, dim=0)
-                avg = stacked.mean(dim=0)
+                avg = _weighted_average(stacked, client_weights)
                 aggregated_state[name] = avg
             else:
                 aggregated_state[name] = reference_tensor.detach().clone()
@@ -201,6 +209,7 @@ def _aggregate_remaining_parameters(
 def aggregate_models(
     client_models: list[ViTForImageClassification],
     matcher: Matcher | None = None,
+    client_weights: torch.Tensor | None = None,
 ) -> StateDict:
     """Aggregate client ViT models with per-layer matched averaging.
 
@@ -212,8 +221,8 @@ def aggregate_models(
     -------
         Aggregated state dict with all tensors on device, preserving native dtypes
     """
-    aggregated_state = _aggregate_encoder_layers(client_models, matcher)
-    return _aggregate_remaining_parameters(client_models, aggregated_state)
+    aggregated_state = _aggregate_encoder_layers(client_models, matcher, client_weights=client_weights)
+    return _aggregate_remaining_parameters(client_models, aggregated_state, client_weights=client_weights)
 
 
 @DistributedContext.on_rank(0)

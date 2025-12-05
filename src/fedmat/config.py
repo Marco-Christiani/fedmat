@@ -25,7 +25,7 @@ class TrainConfig:
     learning_rate: float
     weight_decay: float
     batch_size: int
-    local_steps: int
+    local_steps: int | None
     max_grad_norm: float | None
     log_every_n_steps: int
     use_bf16: bool
