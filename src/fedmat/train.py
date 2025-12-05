@@ -63,11 +63,11 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
         prefetch_factor=train_config.prefetch_factor,
         device=device,
     )
-    client_dataset_lengths = [len(dl) for dl in client_dataloaders]
-    local_steps = train_config.local_steps or max(client_dataset_lengths)
+    client_dataloader_batches = [len(dl) for dl in client_dataloaders]
+    local_steps = train_config.local_steps or max(client_dataloader_batches)
     # TODO configure this with an actual bespoke variable, don't tie everything to local_steps
     if train_config.local_steps is None:
-        client_weights = torch.as_tensor(client_dataset_lengths).to(device) / sum(client_dataset_lengths)
+        client_weights = torch.as_tensor(client_dataloader_batches).to(device) / sum(client_dataloader_batches)
     else:
         client_weights = None
 
@@ -93,7 +93,7 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
     ]
 
     use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
-    logger.info("Dataset lens: %s", client_dataset_lengths)
+    logger.info("Client batches: %s", client_dataloader_batches)
 
     for round_idx in range(train_config.num_rounds):
         logger.info(
