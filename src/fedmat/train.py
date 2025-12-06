@@ -54,6 +54,9 @@ def _build_optimizer(optimizer: Literal["sgd", "adam", "adagrad"], *args, **kwar
 
     return target(*args, **kwargs)
 
+def _compute_gradient_norm(m: torch.nn.Module) -> Tensor:
+    return torch.nn.utils.get_total_norm(p.grad for p in m.parameters() if p.grad is not None)
+
 def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = None) -> float | None:
     """Execute the federated training loop with per-step multi-client scheduling."""
     device = default_device()
@@ -162,6 +165,12 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                 client_model = client_models[client_idx]
                 optimizer = client_optimizers[client_idx]
                 it = client_iters[client_idx]
+                batch_metrics = {
+                    "round": round_idx,
+                    "client": client_idx,
+                    "step": local_step,
+                    "global_step": global_step,
+                }
 
                 try:
                     batch = next(it)
@@ -189,11 +198,18 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
 
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
+
+                    # Log gradient norm
+                    batch_metrics["gradient_norm"] = float(_compute_gradient_norm(client_model))
+
                     if train_config.max_grad_norm is not None:
                         torch.nn.utils.clip_grad_norm_(
                             client_model.parameters(),
                             train_config.max_grad_norm,
                         )
+                        # Log gradient norm after clipping
+                        batch_metrics["clipped_gradient_norm"] = float(_compute_gradient_norm(client_model))
+
                     optimizer.step()
 
                     loss_det = loss.detach()
@@ -208,16 +224,12 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     else:
                         running_loss_gpu[client_idx] = running_loss_gpu[client_idx] + loss_det
 
-                    metrics_dict = {
-                        "round": round_idx,
-                        "client": client_idx,
-                        "step": local_step,
-                        "global_step": global_step,
-                        "loss": float(loss_det.item()),  # sync
-                    }
-                    all_train_metrics.append(metrics_dict)
+                    batch_metrics["loss"] = float(loss_det.item())  # sync
+
+                    # Log metrics for this batch
+                    all_train_metrics.append(batch_metrics)
                     if quiver is not None:
-                        quiver.client_runs[client_idx].log(metrics_dict)
+                        quiver.client_runs[client_idx].log(batch_metrics)
 
                     # Logging - interval or round end
                     # do_log = (
@@ -227,7 +239,6 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     do_log = ((local_step + 1) % train_config.log_every_n_steps == 0) or (
                         local_step == local_steps - 1
                     )
-
                     if do_log and running_loss_gpu[client_idx] is not None:
                         avg_loss_gpu = running_loss_gpu[client_idx] / steps_since_log[client_idx]  # type: ignore
                         avg_loss = float(avg_loss_gpu.item())  # sync
