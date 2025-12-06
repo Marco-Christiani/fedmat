@@ -339,7 +339,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         metrics_df=metrics_df,
         final_confmat=final_confmat,
         final_accuracy=final_accuracy,
-        run=run,
+        run=None if quiver is None else quiver.server_run,
     )
 
     logger.info("Saved run artifacts to %s", artifacts_dir)

@@ -305,7 +305,7 @@ def log_run_artifacts(
 
 class WandbQuiver:
     def __init__(self, group: str, num_clients: int, **kwargs) -> WandbQuiver:
-        self.server_run = wandb.init(group=group, name=f"{group}:server", job_type="main", **kwargs)
+        self.server_run = wandb.init(group=group, name=f"{group}:server", job_type="main", reinit="create_new", **kwargs)
         self.client_runs = [
             wandb.init(group=group, name=f"{group}:client_{client_idx}", job_type="worker", reinit="create_new", **kwargs)
             for client_idx in range(num_clients)
