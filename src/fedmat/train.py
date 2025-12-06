@@ -41,14 +41,19 @@ class MetricRow(TypedDict):
     global_step: int
     loss: float
 
-def _build_optimizer(optimizer: Literal["sgd", "adam", "adagrad"], *args, **kwargs) -> torch.optim.Optimizer:
+def _build_optimizer(optimizer: Literal["sgd", "adam", "adam_amsgrad", "adamw", "adamw_amsgrad"], *args, **kwargs) -> torch.optim.Optimizer:
     if optimizer == "sgd":
         target = torch.optim.SGD
     elif optimizers == "adam":
         target = torch.optim.Adam
-    elif optimizer == "adagrad":
+    elif optimizer == "adam_amsgrad":
         target = torch.optim.Adam
-        kwargs["adagrad"] = True
+        kwargs["amsgrad"] = True
+    elif optimizers == "adamw":
+        target = torch.optim.AdamW
+    elif optimizer == "adamw_amsgrad":
+        target = torch.optim.AdamW
+        kwargs["amsgrad"] = True
     else:
         raise ValueError(f"'{optimizer}' is not a valid optimizer")
 

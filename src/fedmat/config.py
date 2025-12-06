@@ -43,7 +43,7 @@ class TrainConfig:
     num_rounds: int
 
     matcher: Matcher | None
-    optimizer: Literal["sgd", "adam", "adagrad"]
+    optimizer: Literal["sgd", "adam", "adam_amsgrad", "adamw", "adamw_amsgrad"]
     save_round_checkpoints: bool
     save_final_checkpoint: bool
 
