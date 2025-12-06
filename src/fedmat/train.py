@@ -279,12 +279,15 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         round_metrics = { "round": round_idx }
 
         if quiver is not None:
-            delta_norm_sum = 0
+            delta_norms = torch.empty(len(client_models), device=device)
             for client_idx, client_model in enumerate(client_models):
-                delta_norm = float(_models_delta_norm(client_model, model))
+                delta_norm = _models_delta_norm(client_model, model)
                 round_metrics[f"client_{client_idx}_delta_norm"] = delta_norm
-                delta_norm_sum += delta_norm
-            round_metrics[f"client_delta_norm_sum"] = delta_norm_sum
+                delta_norms[client_idx] = delta_norm
+            if client_weights is None:
+                round_metrics[f"client_delta_norm_weighted_average"] = delta_norms.mean()
+            else:
+                round_metrics[f"client_delta_norm_weighted_average"] = (client_weights * delta_norms).sum()
 
         # Aggregate client models into a new global state
         if train_config.enable_timing:
