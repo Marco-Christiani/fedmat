@@ -279,8 +279,12 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         round_metrics = { "round": round_idx }
 
         if quiver is not None:
+            delta_norm_sum = 0
             for client_idx, client_model in enumerate(client_models):
-                round_metrics[f"client_{client_idx}_delta"] = _models_delta_norm(client_model, model)
+                delta_norm = float(_models_delta_norm(client_model, model))
+                round_metrics[f"client_{client_idx}_delta_norm"] = delta_norm
+                delta_norm_sum += delta_norm
+            round_metrics[f"client_delta_norm_sum"] = delta_norm_sum
 
         # Aggregate client models into a new global state
         if train_config.enable_timing:
@@ -300,7 +304,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
             logger.info("Round %d aggregation time: %.3f s", round_idx + 1, elapsed_s)
 
         if quiver is not None:
-            round_metrics["aggregate_delta"] = _models_delta_norm(old_model, model)
+            round_metrics["aggregate_delta_norm"] = float(_models_delta_norm(old_model, model))
 
         accuracy, confmat = evaluate(
             model,

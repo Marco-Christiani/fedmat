@@ -249,7 +249,7 @@ def log_run_artifacts(
     artifacts_dir = run_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().isoformat(timespec="seconds")
+    timestamp = datetime.now().isoformat(timespec="seconds").replace(":", "-")
 
     # Local --------------------------------------------------------------------
     metrics_path = artifacts_dir / f"metrics-{timestamp}.parquet"
@@ -305,7 +305,6 @@ class WandbQuiver:
         ]
 
     def finish(self):
-        __enter__(self)
         self.server_run.finish()
         for client_run in self.client_runs:
             client_run.finish()
