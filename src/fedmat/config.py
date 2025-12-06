@@ -23,6 +23,7 @@ class TrainConfig:
     num_labels: int
 
     learning_rate: float
+    lr_decay: float
     weight_decay: float
     batch_size: int
     local_steps: int | None

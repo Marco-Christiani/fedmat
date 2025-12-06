@@ -125,7 +125,10 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
 
     use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
 
+    learning_rate = train_config.learning_rate
+
     for round_idx in range(train_config.num_rounds):
+        round_metrics = { "round": round_idx }
         logger.info(
             "Starting round %d/%d",
             round_idx + 1,
@@ -145,13 +148,16 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
             optimizer = _build_optimizer(
                 train_config.optimizer,
                 client_model.parameters(),
-                lr=train_config.learning_rate,
+                lr=learning_rate,
                 weight_decay=train_config.weight_decay,
             )
 
             client_models.append(client_model)
             client_optimizers.append(optimizer)
             client_iters.append(iter(dataloader))
+
+        round_metrics["learning_rate"] = learning_rate
+        learning_rate *= train_config.lr_decay
 
         # Per-client running loss on device + logging counters
         running_loss_gpu: list[torch.Tensor | None] = [None] * train_config.num_clients
@@ -280,8 +286,6 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                 round_idx + 1,
                 elapsed_s,
             )
-
-        round_metrics = { "round": round_idx }
 
         if quiver is not None:
             delta_norms = torch.empty(len(client_models), device=device)

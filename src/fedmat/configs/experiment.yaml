@@ -8,6 +8,7 @@ dataset: cifar10
 num_labels: 10
 
 learning_rate: 5e-4
+lr_decay: 1.0
 batch_size: 16
 local_steps: 700
 max_train_samples: 8000
