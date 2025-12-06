@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, TypedDict
 from dataclasses import asdict
 from functools import partial
 
+import cv2
 import albumentations as A
 import hydra
 import polars as pl
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
     from fedmat.config import TrainConfig
 
 logger = logging.getLogger(__name__)
-
+cv2.setNumThreads(0)
 
 class MetricRow(TypedDict):
     """Flat, typed metric record for federated serial training."""
