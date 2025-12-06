@@ -9,7 +9,9 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 from dataclasses import asdict
+from functools import partial
 
+import albumentations as A
 import hydra
 import polars as pl
 import torch
@@ -77,6 +79,15 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
     )
     image_processor = AutoImageProcessor.from_pretrained(train_config.model_name)
 
+    # TODO: configure this with yaml somehow
+    train_image_augmentation = A.Compose([
+        A.RandomResizedCrop(size=(224, 224), scale=(0.8, 1.0)),
+        A.HorizontalFlip(p=0.5),
+        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.8),
+        A.RandomRotate90(),
+        A.GaussNoise(),
+    ])
+
     client_dataloaders, eval_dataloader = build_dataloaders(
         train_ds=train_ds,
         homogeneity=train_config.homogeneity,
@@ -87,6 +98,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         num_workers=train_config.num_workers,
         prefetch_factor=train_config.prefetch_factor,
         device=device,
+        train_image_augmentation=train_image_augmentation,
     )
     client_batches = [len(dl) for dl in client_dataloaders]
     local_steps = train_config.local_steps or max(client_batches)
@@ -273,6 +285,8 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
             if s is not None:
                 s.synchronize()
 
+        round_metrics["global_step"] = global_step
+
         # Timing end for local training.
         if train_config.enable_timing:
             if device.type == "cuda":
@@ -291,7 +305,11 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
             delta_norms = torch.empty(len(client_models), device=device)
             for client_idx, client_model in enumerate(client_models):
                 delta_norm = _models_delta_norm(client_model, model)
-                round_metrics[f"client_{client_idx}_delta_norm"] = delta_norm
+                quiver.client_runs[client_idx].log({
+                    "delta_norm": delta_norm,
+                    "global_step": global_step,
+                    "round": round,
+                })
                 delta_norms[client_idx] = delta_norm
             if client_weights is None:
                 round_metrics[f"client_delta_norm_weighted_average"] = delta_norms.mean()

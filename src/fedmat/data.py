@@ -6,7 +6,10 @@ from collections import defaultdict
 from collections.abc import Sized
 from typing import TYPE_CHECKING
 
+import albumentations as A
+import numpy as np
 import torch
+from PIL import Image
 from datasets import Dataset, load_dataset
 from torch import Tensor
 from torch.distributions import Categorical, Dirichlet
@@ -14,12 +17,11 @@ from torch.utils.data import DataLoader, RandomSampler, Sampler
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from typing import Any, Literal
+    from typing import Any, Callable, Literal
 
     from transformers import AutoImageProcessor
 
 Batch = dict[str, Tensor]
-
 
 def _load_cifar10_subsets(
     max_train_samples: int | None,
@@ -72,7 +74,6 @@ def load_named_dataset_subsets(
 
     return train_ds, eval_ds
 
-
 def build_dataloaders(
     train_ds: Dataset,
     homogeneity: float,
@@ -84,14 +85,15 @@ def build_dataloaders(
     prefetch_factor: int,
     device: torch.device,
     drop_last: bool = False,
+    train_image_augmentation: Callable | None = None,
 ) -> tuple[list[DataLoader[Batch]], DataLoader[Batch]]:
     """Create DataLoaders and wrap them with CUDA prefetching when applicable."""
-    collate_fn = Collator(image_processor)
+    train_collate_fn = Collator(image_processor, train_image_augmentation)
+    eval_collate_fn = Collator(image_processor)
     pin_memory = device.type == "cuda"
 
     common_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
-        "collate_fn": collate_fn,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
         "drop_last": drop_last,
@@ -105,6 +107,7 @@ def build_dataloaders(
         DataLoader(
             train_ds,
             sampler=sampler,
+            collate_fn=train_collate_fn,
             **common_kwargs,
         )
         for sampler in partition_by_client(
@@ -116,12 +119,12 @@ def build_dataloaders(
     eval_loader = DataLoader(
         eval_ds,
         shuffle=False,
+        collate_fn=eval_collate_fn,
         **common_kwargs,
     )
     assert isinstance(train_loaders[0], Sized)
     assert isinstance(eval_loader, Sized)
     return train_loaders, eval_loader
-
 
 class Collator:
     """Image batch collator for processing images with a given processor."""
@@ -129,6 +132,7 @@ class Collator:
     def __init__(
         self,
         image_processor: AutoImageProcessor,
+        augmentation: Callable | None = None,
     ) -> None:
         """Initialize the collator with an image processor.
 
@@ -138,6 +142,7 @@ class Collator:
             Processor to apply to images (e.g., from transformers)
         """
         self.image_processor = image_processor
+        self.augmentation = augmentation
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         """Process a batch of examples.
@@ -152,13 +157,24 @@ class Collator:
         dict[str, torch.Tensor]
             Dictionary with 'pixel_values' and 'labels' tensors
         """
-        images = [example["img"].convert("RGB") for example in batch]
-        labels_list = [int(example["label"]) for example in batch]
+
+        images = []
+        labels = []
+
+        for example in batch:
+            image = np.asarray(example["img"].convert("RGB"))
+            label = int(example["label"])
+            if self.augmentation is not None:
+                output = self.augmentation(image=image, category=label)
+                image = output["image"]
+                label = output["category"]
+            images.append(image)
+            labels.append(label)
 
         encodings = self.image_processor(images=images, return_tensors="pt")
         # encodings["pixel_values"]: [B, C, H, W]
 
-        labels = torch.as_tensor(labels_list, dtype=torch.long)  # [B]
+        labels = torch.as_tensor(labels, dtype=torch.long)  # [B]
         return {
             "pixel_values": encodings["pixel_values"],
             "labels": labels,
