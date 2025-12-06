@@ -49,7 +49,7 @@ def _build_optimizer(optimizer: Literal["sgd", "adam", "adam_amsgrad", "adamw", 
     elif optimizer == "adam_amsgrad":
         target = torch.optim.Adam
         kwargs["amsgrad"] = True
-    elif optimizers == "adamw":
+    elif optimizer == "adamw":
         target = torch.optim.AdamW
     elif optimizer == "adamw_amsgrad":
         target = torch.optim.AdamW
