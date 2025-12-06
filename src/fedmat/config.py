@@ -43,9 +43,12 @@ class TrainConfig:
     num_rounds: int
 
     matcher: Matcher | None
+    optimizer: Literal["sgd", "adam", "adagrad"]
     save_round_checkpoints: bool
     save_final_checkpoint: bool
 
     dataset: Literal["cifar10", "imagenet1k"]
-    enable_timing: bool = False
+
     dry: bool = False
+    enable_timing: bool = False
+    use_wandb: bool = False

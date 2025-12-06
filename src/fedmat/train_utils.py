@@ -19,6 +19,7 @@ from fedmat.utils import as_vit_layer
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
+    from typing import Any
 
     import polars as pl
     from transformers import ViTForImageClassification
@@ -233,6 +234,7 @@ def log_run_artifacts(
     metrics_df: pl.DataFrame,
     final_confmat: torch.Tensor | None,
     final_accuracy: float | None,
+    run: wandb.Run | None = None,
 ) -> Path:
     """Save artifacts from a finished run.
 
@@ -272,7 +274,6 @@ def log_run_artifacts(
     torch.save(model.state_dict(), ckpt_path)
 
     # W&B ----------------------------------------------------------------------
-    run = wandb.run
     if run is not None:
         # table
         run.log({"train/metrics_table": wandb.Table(dataframe=metrics_df.to_pandas())})
@@ -284,7 +285,7 @@ def log_run_artifacts(
         # confusion matrix plot
         if final_confmat is not None:
             run.log({
-                "eval/confusion_matrix": wandb.plots.HeatMap(
+                "eval/confusion_matrix": wandb.plot.HeatMap(
                     x=list(range(final_confmat.shape[0])),
                     y=list(range(final_confmat.shape[1])),
                     z=final_confmat.cpu().numpy().tolist(),
@@ -301,3 +302,17 @@ def log_run_artifacts(
         run.log_artifact(artifact)
 
     return artifacts_dir
+
+class WandbQuiver:
+    def __init__(self, group: str, num_clients: int, **kwargs) -> WandbQuiver:
+        self.server_run = wandb.init(group=group, name=f"{group}:server", job_type="main", **kwargs)
+        self.client_runs = [
+            wandb.init(group=group, name=f"{group}:client_{client_idx}", job_type="worker", reinit="create_new", **kwargs)
+            for client_idx in range(num_clients)
+        ]
+
+    def finish(self):
+        __enter__(self)
+        self.server_run.finish()
+        for client_run in self.client_runs:
+            client_run.finish()

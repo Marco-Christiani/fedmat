@@ -8,10 +8,12 @@ import logging
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
+from dataclasses import asdict
 
 import hydra
 import polars as pl
 import torch
+import wandb
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from transformers import AutoImageProcessor, ViTForImageClassification
@@ -19,7 +21,7 @@ from transformers import AutoImageProcessor, ViTForImageClassification
 from fedmat import install_exception_handlers, install_global_log_context, set_log_context
 from fedmat.data import Batch, build_dataloaders, load_named_dataset_subsets
 from fedmat.evaluate import evaluate
-from fedmat.train_utils import StateDict, aggregate_models, log_run_artifacts
+from fedmat.train_utils import StateDict, aggregate_models, log_run_artifacts, WandbQuiver
 from fedmat.utils import create_vit_classifier, default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
@@ -39,8 +41,20 @@ class MetricRow(TypedDict):
     global_step: int
     loss: float
 
+def _build_optimizer(optimizer: Literal["sgd", "adam", "adagrad"], *args, **kwargs) -> torch.optim.Optimizer:
+    if optimizer == "sgd":
+        target = torch.optim.SGD
+    elif optimizers == "adam":
+        target = torch.optim.Adam
+    elif optimizer == "adagrad":
+        target = torch.optim.Adam
+        kwargs["adagrad"] = True
+    else:
+        raise ValueError(f"'{optimizer}' is not a valid optimizer")
 
-def _run_fed_training(train_config: TrainConfig) -> float | None:
+    return target(*args, **kwargs)
+
+def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = None) -> float | None:
     """Execute the federated training loop with per-step multi-client scheduling."""
     device = default_device()
     logger.info("Using device: %s", device)
@@ -63,13 +77,19 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
         prefetch_factor=train_config.prefetch_factor,
         device=device,
     )
-    client_dataloader_batches = [len(dl) for dl in client_dataloaders]
-    local_steps = train_config.local_steps or max(client_dataloader_batches)
+    client_batches = [len(dl) for dl in client_dataloaders]
+    local_steps = train_config.local_steps or max(client_batches)
     # TODO configure this with an actual bespoke variable, don't tie everything to local_steps
     if train_config.local_steps is None:
-        client_weights = torch.as_tensor(client_dataloader_batches).to(device) / sum(client_dataloader_batches)
+        client_weights = torch.as_tensor(client_batches).to(device) / sum(client_batches)
     else:
         client_weights = None
+
+    logger.info("Client batches: %s", client_batches)
+    logger.info("Client weights: %s", client_weights)
+    if quiver is not None:
+        quiver.server_run.summary["client_batches"] = client_batches
+        quiver.server_run.summary["client_weights"] = client_weights
 
     model: ViTForImageClassification = create_vit_classifier(
         model_name=train_config.model_name,
@@ -93,7 +113,6 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
     ]
 
     use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
-    logger.info("Client batches: %s", client_dataloader_batches)
 
     for round_idx in range(train_config.num_rounds):
         logger.info(
@@ -112,7 +131,8 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
             client_model.load_state_dict(global_state)
             _ = client_model.to(device=device)  # type: ignore
 
-            optimizer = torch.optim.SGD(
+            optimizer = _build_optimizer(
+                train_config.optimizer,
                 client_model.parameters(),
                 lr=train_config.learning_rate,
                 weight_decay=train_config.weight_decay,
@@ -188,13 +208,16 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
                     else:
                         running_loss_gpu[client_idx] = running_loss_gpu[client_idx] + loss_det
 
-                    all_train_metrics.append({
+                    metrics_dict = {
                         "round": round_idx,
                         "client": client_idx,
                         "step": local_step,
                         "global_step": global_step,
                         "loss": float(loss_det.item()),  # sync
-                    })
+                    }
+                    all_train_metrics.append(metrics_dict)
+                    if quiver is not None:
+                        quiver.client_runs[client_idx].log(metrics_dict)
 
                     # Logging - interval or round end
                     # do_log = (
@@ -268,6 +291,14 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
             final_accuracy,
         )
 
+        if quiver is not None:
+            quiver.server_run.log({
+                "round": round_idx,
+                "accuracy": final_accuracy,
+                "confmat": final_confmat,
+                "global_step": global_step,
+            })
+
         # Best-server checkpoint on disk in run dir
         if final_accuracy > best_server_accuracy:
             best_server_accuracy = final_accuracy
@@ -297,6 +328,7 @@ def _run_fed_training(train_config: TrainConfig) -> float | None:
         metrics_df=metrics_df,
         final_confmat=final_confmat,
         final_accuracy=final_accuracy,
+        run=run,
     )
 
     logger.info("Saved run artifacts to %s", artifacts_dir)
@@ -323,14 +355,36 @@ def main(cfg: DictConfig) -> None:
         return
 
     result: float | None = None
+    if config.use_wandb:
+        if config.run_name is None:
+            group = input("Please enter a run name: ")
+        else:
+            group = config.run_name
+        group = group.strip()
+        if group == "":
+            logger.error("No valid group name supplied")
+            return
+        quiver = WandbQuiver(
+            group=group,
+            num_clients=config.num_clients,
+
+            entity="fedmat-team",
+            project="fedmat-project",
+            config=asdict(config),
+            mode="online",
+            dir=str(config.output_dir),
+        )
+    else:
+        quiver = None
     try:
-        result = _run_fed_training(config)
+        result = _run_fed_training(config, quiver)
     finally:
         logger.info(
             "Training finished with accuracy %.4f",
             result or 0.0,
         )
-
+        if quiver is not None:
+            quiver.finish()
 
 if __name__ == "__main__":
     main()

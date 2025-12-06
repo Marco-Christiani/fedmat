@@ -25,6 +25,7 @@ num_clients: ???
 num_rounds: ???
 
 matcher: null
+optimizer: sgd
 
 log_every_n_steps: 100
 use_bf16: true
@@ -37,5 +38,6 @@ save_final_checkpoint: true
 
 output_dir: ${hydra:runtime.output_dir}
 
-enable_timing: true
 dry: false
+enable_timing: true
+use_wandb: false
