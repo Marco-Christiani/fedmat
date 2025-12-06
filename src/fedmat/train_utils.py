@@ -284,14 +284,7 @@ def log_run_artifacts(
 
         # confusion matrix plot
         if final_confmat is not None:
-            run.log({
-                "eval/confusion_matrix": wandb.plot.HeatMap(
-                    x=list(range(final_confmat.shape[0])),
-                    y=list(range(final_confmat.shape[1])),
-                    z=final_confmat.cpu().numpy().tolist(),
-                    title="Confusion Matrix",
-                )
-            })
+            run.log({ "eval/confusion_matrix": final_confmat })
 
         # upload local artifacts from run dir
         artifact = wandb.Artifact(
