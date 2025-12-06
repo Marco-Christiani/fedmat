@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Sized
+from functools import partial
 from typing import TYPE_CHECKING
 
 import albumentations as A
@@ -23,51 +24,58 @@ if TYPE_CHECKING:
 
 Batch = dict[str, Tensor]
 
-def _load_cifar10_subsets(
-    max_train_samples: int | None,
-    max_eval_samples: int | None,
-):
+def _load_cifar10_subsets():
     raw_ds = load_dataset("uoft-cs/cifar10", num_proc=32)
 
-    train_ds = raw_ds["train"]
-    eval_ds = raw_ds["test"]
-
-    if max_train_samples is not None:
-        train_ds = train_ds.select(range(max_train_samples), keep_in_memory=True)
-    if max_eval_samples is not None:
-        eval_ds = eval_ds.select(range(max_eval_samples), keep_in_memory=True)
+    train_ds = raw_ds["train"].rename_column("img", "image")
+    eval_ds = raw_ds["test"].rename_column("img", "image")
 
     return train_ds, eval_ds
 
 
-def _load_imagenet1k_subsets(
-    max_train_samples: int | None,
-    max_eval_samples: int | None,
-):
+def _load_imagenet1k_subsets():
     raw_ds = load_dataset("ILSVRC/imagenet-1k", num_proc=32)
 
-    train_ds = raw_ds["train"].rename_column("image", "img")
-    eval_ds = raw_ds["validation"].rename_column("image", "img")
-
-    if max_train_samples is not None:
-        train_ds = train_ds.select(range(max_train_samples), keep_in_memory=True)
-    if max_eval_samples is not None:
-        eval_ds = eval_ds.select(range(max_eval_samples), keep_in_memory=True)
+    train_ds = raw_ds["train"]
+    eval_ds = raw_ds["validation"]
 
     return train_ds, eval_ds
 
+def _apply_augmentation(augmentation: Callable, examples: dict[str, Any]) -> dict[str, Any]:
+    if "image" not in examples: # e.g. we are doing some kind of label-only transform
+        return examples
+
+    images = [np.asarray(image.convert("RGB")) for image in examples["image"]]
+    labels = [int(label) for label in examples["label"]]
+
+    outputs = [augmentation(image=image, category=label) for image, label in zip(images, labels)]
+
+    examples["image"] = [output["image"] for output in outputs]
+    examples["label"] = [output["category"] for output in outputs]
+
+    return examples
 
 def load_named_dataset_subsets(
     dataset_name: Literal["cifar10", "imagenet1k"],
-    **kwargs,
+    max_train_samples: int | None = None,
+    max_eval_samples: int | None = None,
+    train_augmentation: Callable | None = None,
 ) -> tuple[Dataset, Dataset]:
     """Load some dataset with name dataset_name and apply optional subset selection."""
     if dataset_name == "cifar10":
-        train_ds, eval_ds = _load_cifar10_subsets(**kwargs)
+        train_ds, eval_ds = _load_cifar10_subsets()
     elif dataset_name == "imagenet1k":
-        train_ds, eval_ds = _load_imagenet1k_subsets(**kwargs)
+        train_ds, eval_ds = _load_imagenet1k_subsets()
     else:
         raise ValueError(f"dataset_name must be one of 'cifar10' or 'imagenet1k', got '{dataset_name}'")
+
+    if max_train_samples is not None:
+        train_ds = train_ds.select(range(max_train_samples), keep_in_memory=True)
+    if max_eval_samples is not None:
+        eval_ds = eval_ds.select(range(max_eval_samples), keep_in_memory=True)
+
+    if train_augmentation is not None:
+        train_ds = train_ds.with_transform(partial(_apply_augmentation, train_augmentation))
 
     assert isinstance(train_ds, Dataset)
     assert isinstance(eval_ds, Dataset)
@@ -85,11 +93,9 @@ def build_dataloaders(
     prefetch_factor: int,
     device: torch.device,
     drop_last: bool = False,
-    train_image_augmentation: Callable | None = None,
 ) -> tuple[list[DataLoader[Batch]], DataLoader[Batch]]:
     """Create DataLoaders and wrap them with CUDA prefetching when applicable."""
-    train_collate_fn = Collator(image_processor, train_image_augmentation)
-    eval_collate_fn = Collator(image_processor)
+    collate_fn = Collator(image_processor)
     pin_memory = device.type == "cuda"
 
     common_kwargs: dict[str, Any] = {
@@ -97,6 +103,7 @@ def build_dataloaders(
         "num_workers": num_workers,
         "pin_memory": pin_memory,
         "drop_last": drop_last,
+        "collate_fn": collate_fn,
     }
 
     # Only pass prefetch_factor when using workers
@@ -107,7 +114,6 @@ def build_dataloaders(
         DataLoader(
             train_ds,
             sampler=sampler,
-            collate_fn=train_collate_fn,
             **common_kwargs,
         )
         for sampler in partition_by_client(
@@ -119,7 +125,6 @@ def build_dataloaders(
     eval_loader = DataLoader(
         eval_ds,
         shuffle=False,
-        collate_fn=eval_collate_fn,
         **common_kwargs,
     )
     assert isinstance(train_loaders[0], Sized)
@@ -150,7 +155,7 @@ class Collator:
         Parameters
         ----------
         batch : list[dict[str, Any]]
-            List of examples, each with 'img' and 'label' keys
+            List of examples, each with 'image' and 'label' keys
 
         Returns
         -------
@@ -158,18 +163,8 @@ class Collator:
             Dictionary with 'pixel_values' and 'labels' tensors
         """
 
-        images = []
-        labels = []
-
-        for example in batch:
-            image = np.asarray(example["img"].convert("RGB"))
-            label = int(example["label"])
-            if self.augmentation is not None:
-                output = self.augmentation(image=image, category=label)
-                image = output["image"]
-                label = output["category"]
-            images.append(image)
-            labels.append(label)
+        images = [example["image"] for example in batch]
+        labels = [example["label"] for example in batch]
 
         encodings = self.image_processor(images=images, return_tensors="pt")
         # encodings["pixel_values"]: [B, C, H, W]

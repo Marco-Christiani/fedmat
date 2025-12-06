@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 from dataclasses import asdict
-from functools import partial
 
 import cv2
 import albumentations as A
@@ -73,21 +72,21 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
     device = default_device()
     logger.info("Using device: %s", device)
 
+    # TODO: configure this with yaml somehow
+    train_augmentation = A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.RandomRotate90(p=1.0),
+        A.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.05, hue=0.05, p=0.5),
+        A.GaussNoise(std_range=(0.0, 0.05), noise_scale_factor=0.5, p=0.5),
+    ], seed=train_config.seed)
+
     train_ds, eval_ds = load_named_dataset_subsets(
         dataset_name=train_config.dataset,
+        train_augmentation=train_augmentation,
         max_train_samples=train_config.max_train_samples,
         max_eval_samples=train_config.max_eval_samples,
     )
     image_processor = AutoImageProcessor.from_pretrained(train_config.model_name)
-
-    # TODO: configure this with yaml somehow
-    train_image_augmentation = A.Compose([
-        A.RandomResizedCrop(size=(224, 224), scale=(0.8, 1.0)),
-        A.HorizontalFlip(p=0.5),
-        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.8),
-        A.RandomRotate90(),
-        A.GaussNoise(),
-    ], seed=train_config.seed)
 
     client_dataloaders, eval_dataloader = build_dataloaders(
         train_ds=train_ds,
@@ -99,7 +98,6 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         num_workers=train_config.num_workers,
         prefetch_factor=train_config.prefetch_factor,
         device=device,
-        train_image_augmentation=train_image_augmentation,
     )
     client_batches = [len(dl) for dl in client_dataloaders]
     local_steps = train_config.local_steps or max(client_batches)
