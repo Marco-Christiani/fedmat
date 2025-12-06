@@ -57,6 +57,9 @@ def _build_optimizer(optimizer: Literal["sgd", "adam", "adagrad"], *args, **kwar
 def _compute_gradient_norm(m: torch.nn.Module) -> Tensor:
     return torch.nn.utils.get_total_norm(p.grad for p in m.parameters() if p.grad is not None)
 
+def _models_delta_norm(am: torch.mm.Module, bm: torch.mm.Module) -> Tensor:
+    return torch.nn.utils.get_total_norm(ap - bm.get_parameter(name) for name, ap in am.named_parameters())
+
 def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = None) -> float | None:
     """Execute the federated training loop with per-step multi-client scheduling."""
     device = default_device()
@@ -215,7 +218,6 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     loss_det = loss.detach()
 
                     # Metrics and logging bookkeeping
-                    global_step += 1
                     steps_since_log[client_idx] += 1
 
                     # Accumulate running loss on device
@@ -253,6 +255,8 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                         running_loss_gpu[client_idx] = None
                         steps_since_log[client_idx] = 0
 
+            global_step += 1 # the X-axis should increment only per local step, not between client switches
+
         # Barrier
         for s in streams:
             if s is not None:
@@ -272,6 +276,12 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                 elapsed_s,
             )
 
+        round_metrics = { "round": round_idx }
+
+        if quiver is not None:
+            for client_idx, client_model in enumerate(client_models):
+                round_metrics[f"client_{client_idx}_delta"] = _models_delta_norm(client_model, model)
+
         # Aggregate client models into a new global state
         if train_config.enable_timing:
             start_time = time.perf_counter()
@@ -281,11 +291,16 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
             matcher=train_config.matcher,
             client_weights=client_weights,
         )
+        old_model = copy.deepcopy(model)
         model.load_state_dict(aggregated_state)
+
         global_state = aggregated_state
         if train_config.enable_timing:
             elapsed_s = time.perf_counter() - start_time  # pyright: ignore[reportPossiblyUnboundVariable]
             logger.info("Round %d aggregation time: %.3f s", round_idx + 1, elapsed_s)
+
+        if quiver is not None:
+            round_metrics["aggregate_delta"] = _models_delta_norm(old_model, model)
 
         accuracy, confmat = evaluate(
             model,
@@ -295,6 +310,9 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         )
         final_accuracy = float(accuracy)
         final_confmat = confmat
+        round_metrics["accuracy"] = final_accuracy
+        round_metrics["confmat"] = confmat
+        round_metrics["global_step"] = global_step
 
         logger.info(
             "Server eval after round %d: accuracy=%.4f",
@@ -303,12 +321,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         )
 
         if quiver is not None:
-            quiver.server_run.log({
-                "round": round_idx,
-                "accuracy": final_accuracy,
-                "confmat": final_confmat,
-                "global_step": global_step,
-            })
+            quiver.server_run.log(round_metrics)
 
         # Best-server checkpoint on disk in run dir
         if final_accuracy > best_server_accuracy:
