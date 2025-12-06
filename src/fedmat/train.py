@@ -44,7 +44,7 @@ class MetricRow(TypedDict):
 def _build_optimizer(optimizer: Literal["sgd", "adam", "adam_amsgrad", "adamw", "adamw_amsgrad"], *args, **kwargs) -> torch.optim.Optimizer:
     if optimizer == "sgd":
         target = torch.optim.SGD
-    elif optimizers == "adam":
+    elif optimizer == "adam":
         target = torch.optim.Adam
     elif optimizer == "adam_amsgrad":
         target = torch.optim.Adam
