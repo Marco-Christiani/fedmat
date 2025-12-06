@@ -86,7 +86,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.8),
         A.RandomRotate90(),
         A.GaussNoise(),
-    ])
+    ], seed=train_config.seed)
 
     client_dataloaders, eval_dataloader = build_dataloaders(
         train_ds=train_ds,
@@ -308,7 +308,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                 quiver.client_runs[client_idx].log({
                     "delta_norm": delta_norm,
                     "global_step": global_step,
-                    "round": round,
+                    "round": round_idx,
                 })
                 delta_norms[client_idx] = delta_norm
             if client_weights is None:
