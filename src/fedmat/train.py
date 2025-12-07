@@ -155,7 +155,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
     criterion = FocalLoss(gamma=5.0)
 
     for round_idx in range(train_config.num_rounds):
-        round_metrics: dict[str, float | torch.Tensor] = {"round": round_idx}
+        round_metrics: dict[str, float | torch.Tensor] = { "round": round_idx }
         logger.info(
             "Starting round %d/%d",
             round_idx + 1,
@@ -237,15 +237,16 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
 
+                    # Log gradient norm
+                    gradient_norm = float(_compute_gradient_norm(client_model))
+                    clipped_gradient_norm = gradient_norm
+
                     if train_config.max_grad_norm is not None:
                         torch.nn.utils.clip_grad_norm_(
                             client_model.parameters(),
                             train_config.max_grad_norm,
                         )
-
-                    # Log gradient norm
-                    if quiver is not None:
-                        batch_metrics["gradient_norm"] = float(_compute_gradient_norm(client_model))
+                        clipped_gradient_norm = float(_compute_gradient_norm(client_model))
 
                     optimizer.step()
 
@@ -260,15 +261,13 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     else:
                         running_loss_gpu[client_idx] = running_loss_gpu[client_idx] + loss_det
 
-                    batch_metrics["loss"] = float(loss_det.item())  # sync
-                    batch_metrics["train_accuracy"] = float(batch_accuracy)
-
                     # Log metrics for this batch
                     batch_metrics: MetricRow = {
                         "round": round_idx,
                         "client": client_idx,
                         "step": local_step,
                         "loss": float(loss_det.item()),  # sync
+                        "train_accuracy": float(batch_accuracy),
                         "global_step": global_step,
                         "clipped_gradient_norm": clipped_gradient_norm,
                         "gradient_norm": gradient_norm,
