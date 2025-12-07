@@ -311,10 +311,10 @@ class WandbQuiver:
             client_run.finish()
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha: float, gamma: float) -> FocalLoss:
+    def __init__(self, gamma: float, alpha: float | Tensor = 1.0) -> FocalLoss:
         super().__init__()
-        self.alpha = alpha
         self.gamma = gamma
+        self.alpha = alpha
 
     def forward(self, logits: Tensor, targets: Tensor) -> Tensor:
         # B, C = logits.shape

@@ -152,7 +152,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
 
     learning_rate = train_config.learning_rate
 
-    criterion = FocalLoss(alpha=1.0, gamma=5.0)
+    criterion = FocalLoss(gamma=5.0)
 
     for round_idx in range(train_config.num_rounds):
         round_metrics: dict[str, float | torch.Tensor] = {"round": round_idx}
