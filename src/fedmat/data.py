@@ -7,14 +7,12 @@ from collections.abc import Sized
 from functools import partial
 from typing import TYPE_CHECKING
 
-import albumentations as A
 import numpy as np
 import torch
-from PIL import Image
 from datasets import Dataset, load_dataset
 from torch import Tensor
 from torch.distributions import Categorical, Dirichlet
-from torch.utils.data import DataLoader, RandomSampler, Sampler
+from torch.utils.data import DataLoader, Sampler, SubsetRandomSampler
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -23,6 +21,7 @@ if TYPE_CHECKING:
     from transformers import AutoImageProcessor
 
 Batch = dict[str, Tensor]
+
 
 def _load_cifar10_subsets():
     raw_ds = load_dataset("uoft-cs/cifar10", num_proc=32)
@@ -41,8 +40,9 @@ def _load_imagenet1k_subsets():
 
     return train_ds, eval_ds
 
+
 def _apply_augmentation(augmentation: Callable, examples: dict[str, Any]) -> dict[str, Any]:
-    if "image" not in examples: # e.g. we are doing some kind of label-only transform
+    if "image" not in examples:  # e.g. we are doing some kind of label-only transform
         return examples
 
     images = [np.asarray(image.convert("RGB")) for image in examples["image"]]
@@ -54,6 +54,7 @@ def _apply_augmentation(augmentation: Callable, examples: dict[str, Any]) -> dic
     examples["label"] = [output["category"] for output in outputs]
 
     return examples
+
 
 def load_named_dataset_subsets(
     dataset_name: Literal["cifar10", "imagenet1k"],
@@ -81,6 +82,7 @@ def load_named_dataset_subsets(
     assert isinstance(eval_ds, Dataset)
 
     return train_ds, eval_ds
+
 
 def build_dataloaders(
     train_ds: Dataset,
@@ -131,6 +133,7 @@ def build_dataloaders(
     assert isinstance(eval_loader, Sized)
     return train_loaders, eval_loader
 
+
 class Collator:
     """Image batch collator for processing images with a given processor."""
 
@@ -162,7 +165,6 @@ class Collator:
         dict[str, torch.Tensor]
             Dictionary with 'pixel_values' and 'labels' tensors
         """
-
         images = [example["image"] for example in batch]
         labels = [example["label"] for example in batch]
 
@@ -201,7 +203,7 @@ def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 
         assignments = categorical.sample((len(indices),))
         for idx_within_class, assignment in enumerate(assignments):
             client_indices[int(assignment.item())].append(indices[idx_within_class])
-    return [RandomSampler(indices) for indices in client_indices]
+    return [SubsetRandomSampler(indices) for indices in client_indices]
 
 
 def partition_by_labels(labels: Iterator[int]) -> list[list[int]]:
