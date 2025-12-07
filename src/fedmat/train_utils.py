@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 import wandb
 from torch import Tensor, nn
 
@@ -308,3 +309,23 @@ class WandbQuiver:
         self.server_run.finish()
         for client_run in self.client_runs:
             client_run.finish()
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha: float, gamma: float) -> FocalLoss:
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: Tensor, targets: Tensor) -> Tensor:
+        # B, C = logits.shape
+        # assert targets.shape == (B,)
+        # assert (0 <= targets).all()
+        # assert (targets < C).all(), f"{targets.tolist()}"
+
+        lpt = F.log_softmax(logits, dim=1).gather(1, targets.unsqueeze(1)).squeeze(1)
+        # assert lpt.shape == (B,)
+
+        pt = lpt.exp()
+        loss = - self.alpha * ((1-pt)**self.gamma * lpt).mean()
+
+        return loss

@@ -22,7 +22,7 @@ from transformers import AutoImageProcessor, ViTForImageClassification
 from fedmat import install_exception_handlers, install_global_log_context, set_log_context
 from fedmat.data import Batch, build_dataloaders, load_named_dataset_subsets
 from fedmat.evaluate import evaluate
-from fedmat.train_utils import StateDict, WandbQuiver, aggregate_models, log_run_artifacts
+from fedmat.train_utils import StateDict, WandbQuiver, aggregate_models, log_run_artifacts, FocalLoss
 from fedmat.utils import create_vit_classifier, default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
@@ -85,8 +85,8 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
 
     # TODO: configure this with yaml somehow
     train_augmentation = A.Compose([
-        # A.ColorJitter(),
-        # A.GaussNoise(),
+        A.ColorJitter(),
+        A.GaussNoise(),
         A.Erasing(),
         A.HorizontalFlip(),
         A.RandomRotate90(),
@@ -121,7 +121,8 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         client_weights = None
 
     logger.info("Client batches: %s", client_batches)
-    logger.info("Client weights: %s", client_weights)
+    if client_weights is not None:
+        logger.info("Client weights: %s", client_weights.tolist())
     if quiver is not None:
         quiver.server_run.summary["client_batches"] = client_batches
         quiver.server_run.summary["client_weights"] = client_weights
@@ -150,6 +151,8 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
     use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
 
     learning_rate = train_config.learning_rate
+
+    criterion = FocalLoss(alpha=1.0, gamma=5.0)
 
     for round_idx in range(train_config.num_rounds):
         round_metrics: dict[str, float | torch.Tensor] = {"round": round_idx}
@@ -227,7 +230,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                 with ctx:
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast):
                         outputs: ImageClassifierOutput = client_model(pixel_values=pixel_values, labels=labels)
-                        loss = outputs.loss
+                        loss = criterion(outputs.logits, labels)
                         preds = outputs.logits.argmax(dim=-1)  # [B]
                         batch_accuracy = (preds == labels).sum() / labels.size(0)
 
@@ -258,7 +261,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                         running_loss_gpu[client_idx] = running_loss_gpu[client_idx] + loss_det
 
                     batch_metrics["loss"] = float(loss_det.item())  # sync
-                    batch_metrics["accuracy"] = float(batch_accuracy)
+                    batch_metrics["train_accuracy"] = float(batch_accuracy)
 
                     # Log metrics for this batch
                     batch_metrics: MetricRow = {
@@ -321,10 +324,19 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
             delta_norms = torch.empty(len(client_models), device=device)
             for client_idx, client_model in enumerate(client_models):
                 delta_norm = _models_delta_norm(client_model, model)
+
+                client_eval_accuracy, _ = evaluate(
+                    client_model,
+                    eval_dataloader,
+                    device,
+                    enable_bf16=train_config.use_bf16,
+                )
+
                 quiver.client_runs[client_idx].log({
                     "delta_norm": delta_norm,
                     "global_step": global_step,
                     "round": round_idx,
+                    "eval_accuracy": float(client_eval_accuracy),
                 })
                 delta_norms[client_idx] = delta_norm
             round_metrics["client_delta_norm_weighted_average"] = (
@@ -359,7 +371,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         )
         final_accuracy = float(accuracy)
         final_confmat = confmat
-        round_metrics["accuracy"] = final_accuracy
+        round_metrics["eval_accuracy"] = final_accuracy
         round_metrics["confmat"] = confmat
         round_metrics["global_step"] = global_step
 
