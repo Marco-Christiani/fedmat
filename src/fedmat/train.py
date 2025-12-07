@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
     from transformers.modeling_outputs import ImageClassifierOutput
 
-    from fedmat.config import TrainConfig
+    from fedmat.config import TrainConfig, OptimizerConfig
 
 logger = logging.getLogger(__name__)
 cv2.setNumThreads(0)
@@ -47,12 +47,13 @@ class MetricRow(TypedDict):
     gradient_norm: float
     clipped_gradient_norm: float
 
-
-def _build_optimizer(
-    optimizer: Literal["sgd", "adam", "adam_amsgrad", "adamw", "adamw_amsgrad"], *args, **kwargs
-) -> torch.optim.Optimizer:
+def _build_optimizer(optimizer: OptimizerConfig, params: Iterator[torch.nn.parameter.Parameter], **kwargs) -> torch.optim.Optimizer:
     if optimizer == "sgd":
         target = torch.optim.SGD
+    elif optimizer == "sgd_nesterov":
+        target = torch.optim.SGD
+        kwargs["momentum"] = 0.9
+        kwargs["nesterov"] = True
     elif optimizer == "adam":
         target = torch.optim.Adam
     elif optimizer == "adam_amsgrad":
@@ -66,7 +67,7 @@ def _build_optimizer(
     else:
         raise ValueError(f"'{optimizer}' is not a valid optimizer")
 
-    return target(*args, **kwargs)
+    return target(params, **kwargs)
 
 
 def _compute_gradient_norm(m: torch.nn.Module) -> torch.Tensor:
@@ -83,15 +84,14 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
     logger.info("Using device: %s", device)
 
     # TODO: configure this with yaml somehow
-    train_augmentation = A.Compose(
-        [
-            A.HorizontalFlip(p=0.5),
-            A.RandomRotate90(p=1.0),
-            A.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.05, hue=0.05, p=0.5),
-            A.GaussNoise(std_range=(0.0, 0.05), noise_scale_factor=0.5, p=0.5),
-        ],
-        seed=train_config.seed,
-    )
+    train_augmentation = A.Compose([
+        # A.ColorJitter(),
+        # A.GaussNoise(),
+        A.Erasing(),
+        A.HorizontalFlip(),
+        A.RandomRotate90(),
+        A.Rotate(),
+    ], seed=train_config.seed)
 
     train_ds, eval_ds = load_named_dataset_subsets(
         dataset_name=train_config.dataset,
@@ -181,7 +181,8 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
             client_iters.append(iter(dataloader))
 
         round_metrics["learning_rate"] = learning_rate
-        learning_rate *= train_config.lr_decay
+        if train_config.lr_decay:
+            learning_rate *= train_config.lr_decay
 
         # Per-client running loss on device + logging counters
         running_loss_gpu: list[torch.Tensor | None] = [None] * train_config.num_clients
@@ -227,20 +228,21 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast):
                         outputs: ImageClassifierOutput = client_model(pixel_values=pixel_values, labels=labels)
                         loss = outputs.loss
+                        preds = outputs.logits.argmax(dim=-1)  # [B]
+                        batch_accuracy = (preds == labels).sum() / labels.size(0)
 
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
 
-                    # Log gradient norm
-                    gradient_norm = float(_compute_gradient_norm(client_model))
-                    clipped_gradient_norm = gradient_norm
                     if train_config.max_grad_norm is not None:
                         torch.nn.utils.clip_grad_norm_(
                             client_model.parameters(),
                             train_config.max_grad_norm,
                         )
-                        # Log gradient norm after clipping
-                        clipped_gradient_norm = float(_compute_gradient_norm(client_model))
+
+                    # Log gradient norm
+                    if quiver is not None:
+                        batch_metrics["gradient_norm"] = float(_compute_gradient_norm(client_model))
 
                     optimizer.step()
 
@@ -254,6 +256,9 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                         running_loss_gpu[client_idx] = loss_det
                     else:
                         running_loss_gpu[client_idx] = running_loss_gpu[client_idx] + loss_det
+
+                    batch_metrics["loss"] = float(loss_det.item())  # sync
+                    batch_metrics["accuracy"] = float(batch_accuracy)
 
                     # Log metrics for this batch
                     batch_metrics: MetricRow = {
