@@ -151,8 +151,6 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
 
     use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
 
-    learning_rate = train_config.learning_rate
-
     criterion = FocalLoss(gamma=5.0)
 
     for round_idx in range(train_config.num_rounds):
@@ -162,6 +160,9 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
             round_idx + 1,
             train_config.num_rounds,
         )
+
+        learning_rate = train_config.learning_rate * (train_config.lr_decay ** round_idx)
+        round_metrics["learning_rate"] = learning_rate
 
         # Per-round client models, optimizers, streams, and dataloader iterators
         client_models: list[ViTForImageClassification] = []
@@ -183,10 +184,6 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
             client_models.append(client_model)
             client_optimizers.append(optimizer)
             client_iters.append(iter(dataloader))
-
-        round_metrics["learning_rate"] = learning_rate
-        if train_config.lr_decay:
-            learning_rate *= train_config.lr_decay
 
         # Per-client running loss on device + logging counters
         running_loss_gpu: list[torch.Tensor | None] = [None] * train_config.num_clients
