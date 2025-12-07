@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
     from fedmat.matching import Matcher
 
+OptimizerConfig = Literal["sgd", "sgd_nesterov", "adam", "adam_amsgrad", "adamw", "adamw_amsgrad"]
 
 @dataclass
 class TrainConfig:
@@ -23,7 +24,7 @@ class TrainConfig:
     num_labels: int
 
     learning_rate: float
-    lr_decay: float
+    lr_decay: float | None
     weight_decay: float
     batch_size: int
     local_steps: int | None
@@ -44,7 +45,7 @@ class TrainConfig:
     num_rounds: int
 
     matcher: Matcher | None
-    optimizer: Literal["sgd", "adam", "adam_amsgrad", "adamw", "adamw_amsgrad"]
+    optimizer: OptimizerConfig
     save_round_checkpoints: bool
     save_final_checkpoint: bool
 
