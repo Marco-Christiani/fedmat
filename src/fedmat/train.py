@@ -6,16 +6,15 @@ import contextlib
 import copy
 import logging
 import time
-from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
 from dataclasses import asdict
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, TypedDict
 
-import cv2
 import albumentations as A
+import cv2
 import hydra
 import polars as pl
 import torch
-import wandb
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from transformers import AutoImageProcessor, ViTForImageClassification
@@ -23,16 +22,19 @@ from transformers import AutoImageProcessor, ViTForImageClassification
 from fedmat import install_exception_handlers, install_global_log_context, set_log_context
 from fedmat.data import Batch, build_dataloaders, load_named_dataset_subsets
 from fedmat.evaluate import evaluate
-from fedmat.train_utils import StateDict, aggregate_models, log_run_artifacts, WandbQuiver
+from fedmat.train_utils import StateDict, WandbQuiver, aggregate_models, log_run_artifacts
 from fedmat.utils import create_vit_classifier, default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from transformers.modeling_outputs import ImageClassifierOutput
+
     from fedmat.config import TrainConfig
 
 logger = logging.getLogger(__name__)
 cv2.setNumThreads(0)
+
 
 class MetricRow(TypedDict):
     """Flat, typed metric record for federated serial training."""
@@ -42,8 +44,13 @@ class MetricRow(TypedDict):
     step: int  # local step index within round for this client
     global_step: int
     loss: float
+    gradient_norm: float
+    clipped_gradient_norm: float
 
-def _build_optimizer(optimizer: Literal["sgd", "adam", "adam_amsgrad", "adamw", "adamw_amsgrad"], *args, **kwargs) -> torch.optim.Optimizer:
+
+def _build_optimizer(
+    optimizer: Literal["sgd", "adam", "adam_amsgrad", "adamw", "adamw_amsgrad"], *args, **kwargs
+) -> torch.optim.Optimizer:
     if optimizer == "sgd":
         target = torch.optim.SGD
     elif optimizer == "adam":
@@ -61,11 +68,14 @@ def _build_optimizer(optimizer: Literal["sgd", "adam", "adam_amsgrad", "adamw", 
 
     return target(*args, **kwargs)
 
-def _compute_gradient_norm(m: torch.nn.Module) -> Tensor:
+
+def _compute_gradient_norm(m: torch.nn.Module) -> torch.Tensor:
     return torch.nn.utils.get_total_norm(p.grad for p in m.parameters() if p.grad is not None)
 
-def _models_delta_norm(am: torch.mm.Module, bm: torch.mm.Module) -> Tensor:
+
+def _models_delta_norm(am: torch.nn.Module, bm: torch.nn.Module) -> torch.Tensor:
     return torch.nn.utils.get_total_norm(ap - bm.get_parameter(name) for name, ap in am.named_parameters())
+
 
 def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = None) -> float | None:
     """Execute the federated training loop with per-step multi-client scheduling."""
@@ -73,12 +83,15 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
     logger.info("Using device: %s", device)
 
     # TODO: configure this with yaml somehow
-    train_augmentation = A.Compose([
-        A.HorizontalFlip(p=0.5),
-        A.RandomRotate90(p=1.0),
-        A.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.05, hue=0.05, p=0.5),
-        A.GaussNoise(std_range=(0.0, 0.05), noise_scale_factor=0.5, p=0.5),
-    ], seed=train_config.seed)
+    train_augmentation = A.Compose(
+        [
+            A.HorizontalFlip(p=0.5),
+            A.RandomRotate90(p=1.0),
+            A.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.05, hue=0.05, p=0.5),
+            A.GaussNoise(std_range=(0.0, 0.05), noise_scale_factor=0.5, p=0.5),
+        ],
+        seed=train_config.seed,
+    )
 
     train_ds, eval_ds = load_named_dataset_subsets(
         dataset_name=train_config.dataset,
@@ -139,7 +152,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
     learning_rate = train_config.learning_rate
 
     for round_idx in range(train_config.num_rounds):
-        round_metrics = { "round": round_idx }
+        round_metrics: dict[str, float | torch.Tensor] = {"round": round_idx}
         logger.info(
             "Starting round %d/%d",
             round_idx + 1,
@@ -190,12 +203,6 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                 client_model = client_models[client_idx]
                 optimizer = client_optimizers[client_idx]
                 it = client_iters[client_idx]
-                batch_metrics = {
-                    "round": round_idx,
-                    "client": client_idx,
-                    "step": local_step,
-                    "global_step": global_step,
-                }
 
                 try:
                     batch = next(it)
@@ -218,22 +225,22 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                 )
                 with ctx:
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast):
-                        outputs = client_model(pixel_values=pixel_values, labels=labels)
+                        outputs: ImageClassifierOutput = client_model(pixel_values=pixel_values, labels=labels)
                         loss = outputs.loss
 
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
 
                     # Log gradient norm
-                    batch_metrics["gradient_norm"] = float(_compute_gradient_norm(client_model))
-
+                    gradient_norm = float(_compute_gradient_norm(client_model))
+                    clipped_gradient_norm = gradient_norm
                     if train_config.max_grad_norm is not None:
                         torch.nn.utils.clip_grad_norm_(
                             client_model.parameters(),
                             train_config.max_grad_norm,
                         )
                         # Log gradient norm after clipping
-                        batch_metrics["clipped_gradient_norm"] = float(_compute_gradient_norm(client_model))
+                        clipped_gradient_norm = float(_compute_gradient_norm(client_model))
 
                     optimizer.step()
 
@@ -248,9 +255,16 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     else:
                         running_loss_gpu[client_idx] = running_loss_gpu[client_idx] + loss_det
 
-                    batch_metrics["loss"] = float(loss_det.item())  # sync
-
                     # Log metrics for this batch
+                    batch_metrics: MetricRow = {
+                        "round": round_idx,
+                        "client": client_idx,
+                        "step": local_step,
+                        "loss": float(loss_det.item()),  # sync
+                        "global_step": global_step,
+                        "clipped_gradient_norm": clipped_gradient_norm,
+                        "gradient_norm": gradient_norm,
+                    }
                     all_train_metrics.append(batch_metrics)
                     if quiver is not None:
                         quiver.client_runs[client_idx].log(batch_metrics)
@@ -260,9 +274,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     #     steps_since_log[client_idx] >= train_config.log_every_n_steps
                     #     or local_step == train_config.local_steps - 1
                     # )
-                    do_log = ((local_step + 1) % train_config.log_every_n_steps == 0) or (
-                        local_step == local_steps - 1
-                    )
+                    do_log = ((local_step + 1) % train_config.log_every_n_steps == 0) or (local_step == local_steps - 1)
                     if do_log and running_loss_gpu[client_idx] is not None:
                         avg_loss_gpu = running_loss_gpu[client_idx] / steps_since_log[client_idx]  # type: ignore
                         avg_loss = float(avg_loss_gpu.item())  # sync
@@ -277,7 +289,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                         running_loss_gpu[client_idx] = None
                         steps_since_log[client_idx] = 0
 
-            global_step += 1 # the X-axis should increment only per local step, not between client switches
+            global_step += 1  # the X-axis should increment only per local step, not between client switches
 
         # Barrier
         for s in streams:
@@ -310,10 +322,9 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     "round": round_idx,
                 })
                 delta_norms[client_idx] = delta_norm
-            if client_weights is None:
-                round_metrics[f"client_delta_norm_weighted_average"] = delta_norms.mean()
-            else:
-                round_metrics[f"client_delta_norm_weighted_average"] = (client_weights * delta_norms).sum()
+            round_metrics["client_delta_norm_weighted_average"] = (
+                delta_norms.mean() if client_weights is None else (client_weights * delta_norms).sum()
+            )
 
         # Aggregate client models into a new global state
         if train_config.enable_timing:
@@ -413,10 +424,7 @@ def main(cfg: DictConfig) -> None:
 
     result: float | None = None
     if config.use_wandb:
-        if config.run_name is None:
-            group = input("Please enter a run name: ")
-        else:
-            group = config.run_name
+        group = input("Please enter a run name: ") if config.run_name is None else config.run_name
         group = group.strip()
         if group == "":
             logger.error("No valid group name supplied")
@@ -424,7 +432,6 @@ def main(cfg: DictConfig) -> None:
         quiver = WandbQuiver(
             group=group,
             num_clients=config.num_clients,
-
             entity="fedmat-team",
             project="fedmat-project",
             config=asdict(config),
@@ -442,6 +449,7 @@ def main(cfg: DictConfig) -> None:
         )
         if quiver is not None:
             quiver.finish()
+
 
 if __name__ == "__main__":
     main()
