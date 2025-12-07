@@ -78,7 +78,7 @@ def _models_delta_norm(am: torch.nn.Module, bm: torch.nn.Module) -> torch.Tensor
     return torch.nn.utils.get_total_norm(ap - bm.get_parameter(name) for name, ap in am.named_parameters())
 
 def _client_histograms_to_client_class_weights(client_histograms: torch.Tensor) -> torch.Tensor:
-    inv_freq = 1 / client_histograms
+    inv_freq = (1 / client_histograms).nan_to_num()
     return inv_freq / inv_freq.sum(dim=1).unsqueeze(1)
 
 def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = None) -> float | None:
