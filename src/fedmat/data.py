@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections import defaultdict
 from collections.abc import Sized
 from functools import partial
@@ -22,8 +21,6 @@ if TYPE_CHECKING:
     from fedmat.train_utils import WandbQuiver
 
     from transformers import AutoImageProcessor
-
-logger = logging.getLogger(__name__)
 
 Batch = dict[str, Tensor]
 
@@ -99,8 +96,7 @@ def build_dataloaders(
     prefetch_factor: int,
     device: torch.device,
     drop_last: bool = False,
-    quiver: WandbQuiver | None = None,
-) -> tuple[list[DataLoader[Batch]], DataLoader[Batch]]:
+) -> tuple[list[DataLoader[Batch]], DataLoader[Batch], Tensor]:
     """Create DataLoaders and wrap them with CUDA prefetching when applicable."""
     collate_fn = Collator(image_processor)
     pin_memory = device.type == "cuda"
@@ -117,11 +113,10 @@ def build_dataloaders(
     if num_workers > 0:
         common_kwargs["prefetch_factor"] = prefetch_factor
 
-    samplers = partition_by_client(
+    samplers, client_histograms = partition_by_client(
         (dict["label"] for dict in train_ds.select_columns("label")),
         num_clients,
         homogeneity,
-        quiver=quiver,
     )
     train_loaders = [
         DataLoader(
@@ -140,7 +135,7 @@ def build_dataloaders(
     assert isinstance(train_loaders[0], Sized)
     assert isinstance(eval_loader, Sized)
 
-    return train_loaders, eval_loader
+    return train_loaders, eval_loader, client_histograms
 
 
 class Collator:
@@ -187,7 +182,7 @@ class Collator:
         }
 
 
-def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 1.0, quiver: WandbQuiver | None = None) -> list[Sampler]:
+def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 1.0) -> tuple[list[Sampler], Tensor]:
     """Partition dataset labels among clients using Dirichlet distribution.
 
     Parameters
@@ -216,12 +211,9 @@ def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 
             client_histograms[client_idx][class_idx] += 1
             client_indices[client_idx].append(indices[idx_within_class])
 
-    for client_idx, histogram in enumerate(client_histograms):
-        logger.info("Client %d class distribution: %s", client_idx + 1, histogram)
-        if quiver is not None:
-            quiver.client_runs[client_idx].summary["class_distribution"] = histogram
+    client_histograms = torch.as_tensor(client_histograms)
 
-    return [SubsetRandomSampler(indices) for indices in client_indices]
+    return [SubsetRandomSampler(indices) for indices in client_indices], client_histograms
 
 
 def partition_by_labels(labels: Iterator[int]) -> list[list[int]]:

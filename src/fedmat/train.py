@@ -77,6 +77,9 @@ def _compute_gradient_norm(m: torch.nn.Module) -> torch.Tensor:
 def _models_delta_norm(am: torch.nn.Module, bm: torch.nn.Module) -> torch.Tensor:
     return torch.nn.utils.get_total_norm(ap - bm.get_parameter(name) for name, ap in am.named_parameters())
 
+def _client_histograms_to_client_class_weights(client_histograms: torch.Tensor) -> torch.Tensor:
+    inv_freq = 1 / client_histograms
+    return inv_freq / inv_freq.sum(dim=1).unsqueeze(1)
 
 def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = None) -> float | None:
     """Execute the federated training loop with per-step multi-client scheduling."""
@@ -101,7 +104,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
     )
     image_processor = AutoImageProcessor.from_pretrained(train_config.model_name)
 
-    client_dataloaders, eval_dataloader = build_dataloaders(
+    client_dataloaders, eval_dataloader, client_histograms = build_dataloaders(
         train_ds=train_ds,
         homogeneity=train_config.homogeneity,
         num_clients=train_config.num_clients,
@@ -111,7 +114,6 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         num_workers=train_config.num_workers,
         prefetch_factor=train_config.prefetch_factor,
         device=device,
-        quiver=quiver,
     )
     client_batches = [len(dl) for dl in client_dataloaders]
     local_steps = train_config.local_steps or max(client_batches)
@@ -120,13 +122,17 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         client_weights = torch.as_tensor(client_batches).to(device) / sum(client_batches)
     else:
         client_weights = None
+    client_class_weights = _client_histograms_to_client_class_weights(client_histograms)
 
     logger.info("Client batches: %s", client_batches)
-    if client_weights is not None:
-        logger.info("Client weights: %s", client_weights.tolist())
+    logger.info("Client weights: %s", client_weights.tolist() if client_weights is not None else None)
+    logger.info("Client class distribution: %s", client_histograms)
+    logger.info("Client class weights: %s", client_class_weights)
     if quiver is not None:
         quiver.server_run.summary["client_batches"] = client_batches
         quiver.server_run.summary["client_weights"] = client_weights
+        quiver.server_run.summary["client_histograms"] = client_histograms
+        quiver.server_run.summary["client_class_weights"] = client_class_weights
 
     model: ViTForImageClassification = create_vit_classifier(
         model_name=train_config.model_name,
@@ -151,8 +157,6 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
 
     use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
 
-    criterion = FocalLoss(gamma=5.0)
-
     for round_idx in range(train_config.num_rounds):
         round_metrics: dict[str, float | torch.Tensor] = { "round": round_idx }
         logger.info(
@@ -168,6 +172,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         client_models: list[ViTForImageClassification] = []
         client_optimizers: list[torch.optim.Optimizer] = []
         client_iters: list[Iterator[Batch]] = []
+        client_criterions: list[torch.nn.Module] = []
 
         for client_idx, dataloader in enumerate(client_dataloaders):
             client_model = copy.deepcopy(model)  # init from current server arch
@@ -180,10 +185,13 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                 lr=learning_rate,
                 weight_decay=train_config.weight_decay,
             )
+            criterion = FocalLoss(gamma=5.0, alpha=client_class_weights[client_idx]) # we can weigh focalloss now
+            _ = criterion.to(device=device)  # type: ignore
 
             client_models.append(client_model)
             client_optimizers.append(optimizer)
             client_iters.append(iter(dataloader))
+            client_criterions.append(criterion)
 
         # Per-client running loss on device + logging counters
         running_loss_gpu: list[torch.Tensor | None] = [None] * train_config.num_clients
@@ -205,6 +213,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                 client_model = client_models[client_idx]
                 optimizer = client_optimizers[client_idx]
                 it = client_iters[client_idx]
+                criterion = client_criterions[client_idx]
 
                 try:
                     batch = next(it)
