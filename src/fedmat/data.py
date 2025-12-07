@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from collections.abc import Sized
 from functools import partial
@@ -18,10 +19,13 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from typing import Any, Callable, Literal
 
+    from fedmat.train_utils import WandbQuiver
+
     from transformers import AutoImageProcessor
 
-Batch = dict[str, Tensor]
+logger = logging.getLogger(__name__)
 
+Batch = dict[str, Tensor]
 
 def _load_cifar10_subsets():
     raw_ds = load_dataset("uoft-cs/cifar10", num_proc=32)
@@ -95,6 +99,7 @@ def build_dataloaders(
     prefetch_factor: int,
     device: torch.device,
     drop_last: bool = False,
+    quiver: WandbQuiver | None = None,
 ) -> tuple[list[DataLoader[Batch]], DataLoader[Batch]]:
     """Create DataLoaders and wrap them with CUDA prefetching when applicable."""
     collate_fn = Collator(image_processor)
@@ -112,25 +117,29 @@ def build_dataloaders(
     if num_workers > 0:
         common_kwargs["prefetch_factor"] = prefetch_factor
 
+    samplers = partition_by_client(
+        (dict["label"] for dict in train_ds.select_columns("label")),
+        num_clients,
+        homogeneity,
+        quiver=quiver,
+    )
     train_loaders = [
         DataLoader(
             train_ds,
             sampler=sampler,
             **common_kwargs,
         )
-        for sampler in partition_by_client(
-            (dict["label"] for dict in train_ds.select_columns("label")),
-            num_clients,
-            homogeneity,
-        )
+        for sampler in samplers
     ]
     eval_loader = DataLoader(
         eval_ds,
         shuffle=False,
         **common_kwargs,
     )
+
     assert isinstance(train_loaders[0], Sized)
     assert isinstance(eval_loader, Sized)
+
     return train_loaders, eval_loader
 
 
@@ -178,7 +187,7 @@ class Collator:
         }
 
 
-def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 1.0) -> list[Sampler]:
+def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 1.0, quiver: WandbQuiver | None = None) -> list[Sampler]:
     """Partition dataset labels among clients using Dirichlet distribution.
 
     Parameters
@@ -198,11 +207,20 @@ def partition_by_client(labels: Iterator[int], num_clients: int, alpha: float = 
     class_indices = partition_by_labels(labels)
     dirichlet = Dirichlet(alpha * torch.ones(num_clients) / num_clients)
     client_indices = [[] for _ in range(num_clients)]
-    for indices in class_indices:
+    client_histograms = [[0 for _ in class_indices] for _ in range(num_clients)]
+    for class_idx, indices in enumerate(class_indices):
         categorical = Categorical(dirichlet.sample())
         assignments = categorical.sample((len(indices),))
         for idx_within_class, assignment in enumerate(assignments):
-            client_indices[int(assignment.item())].append(indices[idx_within_class])
+            client_idx = int(assignment.item())
+            client_histograms[client_idx][class_idx] += 1
+            client_indices[client_idx].append(indices[idx_within_class])
+
+    for client_idx, histogram in enumerate(client_histograms):
+        logger.info("Client %d class distribution: %s", client_idx + 1, histogram)
+        if quiver is not None:
+            quiver.client_runs[client_idx].summary["class_distribution"] = histogram
+
     return [SubsetRandomSampler(indices) for indices in client_indices]
 
 

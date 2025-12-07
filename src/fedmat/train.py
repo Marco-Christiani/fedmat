@@ -111,6 +111,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         num_workers=train_config.num_workers,
         prefetch_factor=train_config.prefetch_factor,
         device=device,
+        quiver=quiver,
     )
     client_batches = [len(dl) for dl in client_dataloaders]
     local_steps = train_config.local_steps or max(client_batches)
