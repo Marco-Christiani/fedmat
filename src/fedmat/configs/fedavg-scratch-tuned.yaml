@@ -12,7 +12,7 @@ lr_decay: 0.95
 weight_decay: 0.01
 batch_size: 64
 local_steps: 500
-max_grad_norm: 6.0
+max_grad_norm: 2.0
 log_every_n_steps: 50
 use_bf16: true
 use_torch_compile: true
