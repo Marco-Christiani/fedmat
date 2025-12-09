@@ -1,7 +1,7 @@
 defaults:
-  - matcher: null
   - base
   - _self_
+  - matcher: hungarian
 
 _target_: fedmat.config.TrainConfig
 run_name:
@@ -25,7 +25,6 @@ num_rounds: 100
 save_round_checkpoints: true
 save_final_checkpoint: true
 dry: false
-matcher: null
 optimizer: adamw_amsgrad
 
 dataset: cifar10

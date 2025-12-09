@@ -75,18 +75,13 @@ def create_vit_classifier(
     use_pretrained: bool,
 ) -> ViTForImageClassification:
     """Construct a ViT classifier with consistent label mappings."""
-    if use_pretrained:
-        model = ViTForImageClassification.from_pretrained(
-            model_name,
-            num_labels=num_labels,
-            # device_map="auto",
-        )
-    else:
-        model = ViTForImageClassification(
-            ViTConfig(
-                num_labels=num_labels,
-            )
-        )
+    model = ViTForImageClassification.from_pretrained(
+        model_name,
+        num_labels=num_labels,
+        # device_map="auto",
+    )
+    if not use_pretrained:
+        model.apply(model._init_weights)
 
     model.config.id2label = {i: str(i) for i in range(num_labels)}
     model.config.label2id = {str(i): i for i in range(num_labels)}

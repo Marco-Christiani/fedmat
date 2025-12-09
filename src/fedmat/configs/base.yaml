@@ -1,5 +1,4 @@
 defaults:
-  - matcher: null
   - _self_
 
 _target_: fedmat.config.TrainConfig
@@ -40,4 +39,5 @@ output_dir: ${hydra:runtime.output_dir}
 
 dry: false
 enable_timing: true
-use_wandb: false
+use_wandb: true
+per_client_init: false

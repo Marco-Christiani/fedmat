@@ -175,8 +175,15 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         client_criterions: list[torch.nn.Module] = []
 
         for client_idx, dataloader in enumerate(client_dataloaders):
-            client_model = copy.deepcopy(model)  # init from current server arch
-            client_model.load_state_dict(global_state)
+            if round_idx == 0 and train_config.per_client_init:
+                client_model = create_vit_classifier(
+                    model_name=train_config.model_name,
+                    num_labels=train_config.num_labels,
+                    use_pretrained=train_config.use_pretrained,
+                )
+            else:
+                client_model = copy.deepcopy(model)  # init from current server arch
+                client_model.load_state_dict(global_state)
             _ = client_model.to(device=device)  # type: ignore
 
             optimizer = _build_optimizer(

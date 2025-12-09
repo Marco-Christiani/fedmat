@@ -54,3 +54,5 @@ class TrainConfig:
     dry: bool = False
     enable_timing: bool = False
     use_wandb: bool = False
+
+    per_client_init: bool = False
