@@ -276,3 +276,4 @@ class DirichletSampler(Sampler):
     def __len__(self) -> int:
         """Return the minimum class size to ensure balanced sampling."""
         return torch.min(self.class_sizes)
+

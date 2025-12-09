@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 OptimizerConfig = Literal["sgd", "sgd_nesterov", "adam", "adam_amsgrad", "adamw", "adamw_amsgrad"]
 
+
 @dataclass
 class TrainConfig:
     """Runtime configuration for training or federated experiments."""
@@ -25,6 +26,7 @@ class TrainConfig:
 
     learning_rate: float
     lr_decay: float | None
+    lr_min: float | None
     weight_decay: float
     batch_size: int
     local_steps: int | None
@@ -32,6 +34,7 @@ class TrainConfig:
     log_every_n_steps: int
     use_bf16: bool
     use_torch_compile: bool
+    enable_fed_weights: bool
 
     max_train_samples: int | None
     max_eval_samples: int | None
@@ -56,3 +59,5 @@ class TrainConfig:
     use_wandb: bool = False
 
     per_client_init: bool = False
+    wandb_entity: str = "fedmat-team"
+    wandb_project: str = "fedmat-project"

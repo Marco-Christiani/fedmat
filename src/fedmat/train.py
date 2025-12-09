@@ -17,12 +17,14 @@ import polars as pl
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
+from torch import nn
+from tqdm.auto import trange
 from transformers import AutoImageProcessor, ViTForImageClassification
 
 from fedmat import install_exception_handlers, install_global_log_context, set_log_context
 from fedmat.data import Batch, build_dataloaders, load_named_dataset_subsets
 from fedmat.evaluate import evaluate
-from fedmat.train_utils import FocalLoss, StateDict, WandbQuiver, aggregate_models, log_run_artifacts
+from fedmat.train_utils import StateDict, WandbQuiver, aggregate_models, log_run_artifacts
 from fedmat.utils import create_vit_classifier, default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
@@ -73,6 +75,7 @@ class _PendingLog:
     global_step: int
     loss_sum: torch.Tensor
     steps: int
+    learning_rate: float
 
 
 def _build_optimizer(
@@ -110,11 +113,6 @@ def _models_delta_norm(am: torch.nn.Module, bm: torch.nn.Module) -> torch.Tensor
     return torch.nn.utils.get_total_norm(ap - bm.get_parameter(name) for name, ap in am.named_parameters())
 
 
-def _client_histograms_to_client_class_weights(client_histograms: torch.Tensor) -> torch.Tensor:
-    inv_freq = (1 / client_histograms).nan_to_num()
-    return inv_freq / inv_freq.sum(dim=1).unsqueeze(1)
-
-
 def _finalize_pending_metrics(
     pending_metrics: list[_PendingMetric],
     pending_logs: list[_PendingLog],
@@ -139,6 +137,8 @@ def _finalize_pending_metrics(
             "gradient_norm": float(metric.gradient_norm.item()),
         }
         all_train_metrics.append(metrics_payload)
+        msg = " ".join(["=".join(map(str, kv)) for kv in metrics_payload.items()])
+        logger.debug(msg)
         if quiver is not None:
             quiver.client_runs[metric.client_idx].log(metrics_payload)
     pending_metrics.clear()
@@ -146,14 +146,30 @@ def _finalize_pending_metrics(
     for log_payload in pending_logs:
         avg_loss = float((log_payload.loss_sum / max(log_payload.steps, 1)).item())
         logger.info(
-            "Round %d client %d local_step %d global_step %d avg_loss=%.4f",
+            "Round %d client %d local_step %d global_step %d lr=%.2e avg_loss=%.4f",
             round_idx + 1,
             log_payload.client_idx + 1,
             log_payload.local_step,
             log_payload.global_step,
+            log_payload.learning_rate,
             avg_loss,
         )
     pending_logs.clear()
+
+
+def _compute_round_learning_rate(
+    base_lr: float,
+    lr_decay: float | None,
+    round_idx: int,
+    lr_min: float = 1e-5,
+    warmup_rounds: int = 5,
+) -> float:
+    """Linear warmup to base_lr, then optional exponential decay."""
+    if round_idx < warmup_rounds:
+        return max(lr_min, base_lr * float(round_idx + 1) / warmup_rounds)
+    decay = 1.0 if lr_decay is None else lr_decay
+    effective_round = max(round_idx - warmup_rounds, 0)
+    return max(lr_min, base_lr * (decay ** effective_round))
 
 
 def _run_fed_training(  # noqa: C901
@@ -166,12 +182,8 @@ def _run_fed_training(  # noqa: C901
 
     # TODO: configure this with yaml somehow
     train_augmentation = A.Compose([
-        A.ColorJitter(),
-        A.GaussNoise(),
-        A.Erasing(),
-        A.HorizontalFlip(),
-        A.RandomRotate90(),
-        A.Rotate(),
+        A.HorizontalFlip(p=0.5),
+        # A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=0.2),
     ], seed=train_config.seed)
 
     train_ds, eval_ds = load_named_dataset_subsets(
@@ -195,22 +207,22 @@ def _run_fed_training(  # noqa: C901
     )
     client_batches = [len(dl) for dl in client_dataloaders]
     local_steps = train_config.local_steps or max(client_batches)
-    # TODO configure this with an actual bespoke variable, don't tie everything to local_steps
-    if train_config.local_steps is None:
-        client_weights = torch.as_tensor(client_batches).to(device) / sum(client_batches)
-    else:
-        client_weights = None
-    client_class_weights = _client_histograms_to_client_class_weights(client_histograms)
+    client_weights = (
+        torch.as_tensor(client_batches).to(device) / sum(client_batches)
+        if train_config.enable_fed_weights
+        else None
+    )
 
+    logger.info("Client local steps: %s", local_steps)
     logger.info("Client batches: %s", client_batches)
     logger.info("Client weights: %s", client_weights.tolist() if client_weights is not None else None)
     logger.info("Client class distribution: %s", client_histograms)
-    logger.info("Client class weights: %s", client_class_weights)
     if quiver is not None:
         quiver.server_run.summary["client_batches"] = client_batches
-        quiver.server_run.summary["client_weights"] = client_weights
-        quiver.server_run.summary["client_histograms"] = client_histograms
-        quiver.server_run.summary["client_class_weights"] = client_class_weights
+        quiver.server_run.summary["client_weights"] = (
+            client_weights.detach().cpu().tolist() if client_weights is not None else None
+        )
+        quiver.server_run.summary["client_histograms"] = client_histograms.detach().cpu().tolist()
 
     model: ViTForImageClassification = create_vit_classifier(
         model_name=train_config.model_name,
@@ -235,7 +247,24 @@ def _run_fed_training(  # noqa: C901
 
     use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
 
-    for round_idx in range(train_config.num_rounds):
+    client_models: list[ViTForImageClassification] = []
+    client_criterions: list[torch.nn.Module] = []
+    for _ in range(train_config.num_clients):
+        if train_config.per_client_init:
+            cm = create_vit_classifier(
+                model_name=train_config.model_name,
+                num_labels=train_config.num_labels,
+                use_pretrained=train_config.use_pretrained,
+            )
+        else:
+            cm = copy.deepcopy(model)
+        _ = cm.to(device=device)
+        client_models.append(cm)
+        crit: nn.Module = nn.CrossEntropyLoss()
+        _ = crit.to(device=device)
+        client_criterions.append(crit)
+
+    for round_idx in trange(train_config.num_rounds):
         round_metrics: dict[str, float | torch.Tensor] = {"round": round_idx}
         logger.info(
             "Starting round %d/%d",
@@ -245,40 +274,37 @@ def _run_fed_training(  # noqa: C901
         pending_metrics: list[_PendingMetric] = []
         pending_logs: list[_PendingLog] = []
 
-        learning_rate = train_config.learning_rate * (train_config.lr_decay ** round_idx)
+        learning_rate = _compute_round_learning_rate(
+            base_lr=train_config.learning_rate,
+            lr_decay=train_config.lr_decay,
+            lr_min=train_config.lr_min or 1e-5,
+            round_idx=round_idx,
+            warmup_rounds=5,
+        )
         round_metrics["learning_rate"] = learning_rate
 
-        # Per-round client models, optimizers, streams, and dataloader iterators
-        client_models: list[ViTForImageClassification] = []
+        # Per-round optimizers and dataloader iterators
         client_optimizers: list[torch.optim.Optimizer] = []
         client_iters: list[Iterator[Batch]] = []
-        client_criterions: list[torch.nn.Module] = []
 
         for client_idx, dataloader in enumerate(client_dataloaders):
-            if round_idx == 0 and train_config.per_client_init:
-                client_model = create_vit_classifier(
-                    model_name=train_config.model_name,
-                    num_labels=train_config.num_labels,
-                    use_pretrained=train_config.use_pretrained,
-                )
-            else:
-                client_model = copy.deepcopy(model)  # init from current server arch
-                client_model.load_state_dict(global_state)
-            _ = client_model.to(device=device)  # type: ignore
+            stream = streams[client_idx]
+            with (
+                torch.cuda.stream(stream)
+                if (stream is not None and device.type == "cuda")
+                else contextlib.nullcontext()
+            ):
+                client_models[client_idx].load_state_dict(global_state)
 
             optimizer = _build_optimizer(
                 train_config.optimizer,
-                client_model.parameters(),
+                client_models[client_idx].parameters(),
                 lr=learning_rate,
                 weight_decay=train_config.weight_decay,
             )
-            criterion = FocalLoss(gamma=5.0, alpha=client_class_weights[client_idx])  # we can weigh focalloss now
-            _ = criterion.to(device=device)  # type: ignore
 
-            client_models.append(client_model)
             client_optimizers.append(optimizer)
             client_iters.append(iter(dataloader))
-            client_criterions.append(criterion)
 
         # Per-client running loss on device + logging counters
         running_loss_gpu: list[torch.Tensor | None] = [None] * train_config.num_clients
@@ -289,6 +315,7 @@ def _run_fed_training(  # noqa: C901
             if device.type == "cuda":
                 start_evt = torch.cuda.Event(enable_timing=True)
                 end_evt = torch.cuda.Event(enable_timing=True)
+                torch.cuda.synchronize()
                 start_evt.record()
             else:
                 start_time = time.perf_counter()
@@ -315,8 +342,6 @@ def _run_fed_training(  # noqa: C901
                 client_model.train()
 
                 non_blocking = device.type == "cuda"
-                pixel_values = batch["pixel_values"].to(device, non_blocking=non_blocking)
-                labels = batch["labels"].to(device, non_blocking=non_blocking)
 
                 ctx = (
                     torch.cuda.stream(stream)
@@ -324,13 +349,14 @@ def _run_fed_training(  # noqa: C901
                     else contextlib.nullcontext()
                 )
                 with ctx:
+                    pixel_values = batch["pixel_values"].to(device, non_blocking=non_blocking)
+                    labels = batch["labels"].to(device, non_blocking=non_blocking)
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast):
                         outputs: ImageClassifierOutput = client_model(pixel_values=pixel_values, labels=labels)
-                        loss = criterion(outputs.logits, labels)
-                        preds = outputs.logits.argmax(dim=-1)  # [B]
-                        batch_accuracy = (preds == labels).sum() / labels.size(0)
+                    logits = outputs.logits
 
                     optimizer.zero_grad(set_to_none=True)
+                    loss = criterion(logits.float() if use_autocast else logits, labels)
                     loss.backward()
 
                     # Log gradient norm
@@ -347,45 +373,48 @@ def _run_fed_training(  # noqa: C901
                     optimizer.step()
 
                     loss_det = loss.detach()
-                    batch_accuracy_det = batch_accuracy.detach()
+                    with torch.no_grad():
+                        preds = logits.argmax(dim=-1)  # [B]
+                        batch_accuracy_det = (preds == labels).sum() / labels.size(0)
 
-                    # Metrics and logging bookkeeping
-                    steps_since_log[client_idx] += 1
+                # Metrics and bookkeeping
+                steps_since_log[client_idx] += 1
 
-                    # Accumulate running loss on device
-                    if running_loss_gpu[client_idx] is None:
-                        running_loss_gpu[client_idx] = loss_det
-                    else:
-                        running_loss_gpu[client_idx] = running_loss_gpu[client_idx] + loss_det
+                if running_loss_gpu[client_idx] is None:
+                    running_loss_gpu[client_idx] = loss_det
+                else:
+                    running_loss_gpu[client_idx] = running_loss_gpu[client_idx] + loss_det
 
-                    pending_metrics.append(_PendingMetric(
+                pending_metrics.append(_PendingMetric(
+                    round_idx=round_idx,
+                    client_idx=client_idx,
+                    local_step=local_step,
+                    global_step=current_global_step,
+                    loss=loss_det,
+                    train_accuracy=batch_accuracy_det,
+                    gradient_norm=gradient_norm,
+                    clipped_gradient_norm=clipped_gradient_norm,
+                ))
+
+                # Logging - interval or round end
+                do_log = (
+                    (steps_since_log[client_idx] >= train_config.log_every_n_steps)
+                    or (local_step == local_steps - 1)
+                )
+                # do_log = ((local_step + 1) % train_config.log_every_n_steps == 0) or (local_step == local_steps - 1)
+
+                if do_log and running_loss_gpu[client_idx] is not None:
+                    pending_logs.append(_PendingLog(
                         round_idx=round_idx,
                         client_idx=client_idx,
                         local_step=local_step,
                         global_step=current_global_step,
-                        loss=loss_det,
-                        train_accuracy=batch_accuracy_det,
-                        gradient_norm=gradient_norm,
-                        clipped_gradient_norm=clipped_gradient_norm,
+                        loss_sum=running_loss_gpu[client_idx],
+                        steps=steps_since_log[client_idx],
+                        learning_rate=learning_rate,
                     ))
-
-                    # Logging - interval or round end
-                    # do_log = (
-                    #     steps_since_log[client_idx] >= train_config.log_every_n_steps
-                    #     or local_step == train_config.local_steps - 1
-                    # )
-                    do_log = ((local_step + 1) % train_config.log_every_n_steps == 0) or (local_step == local_steps - 1)
-                    if do_log and running_loss_gpu[client_idx] is not None:
-                        pending_logs.append(_PendingLog(
-                            round_idx=round_idx,
-                            client_idx=client_idx,
-                            local_step=local_step,
-                            global_step=current_global_step,
-                            loss_sum=running_loss_gpu[client_idx],
-                            steps=steps_since_log[client_idx],
-                        ))
-                        running_loss_gpu[client_idx] = None
-                        steps_since_log[client_idx] = 0
+                    running_loss_gpu[client_idx] = None
+                    steps_since_log[client_idx] = 0
 
             global_step += 1  # the X-axis should increment only per local step, not between client switches
 
@@ -423,6 +452,7 @@ def _run_fed_training(  # noqa: C901
             delta_norms = torch.empty(len(client_models), device=device)
             for client_idx, client_model in enumerate(client_models):
                 delta_norm = _models_delta_norm(client_model, model)
+                delta_norm_f = float(delta_norm)
 
                 client_eval_accuracy, _ = evaluate(
                     client_model,
@@ -432,7 +462,7 @@ def _run_fed_training(  # noqa: C901
                 )
 
                 quiver.client_runs[client_idx].log({
-                    "delta_norm": delta_norm,
+                    "delta_norm": delta_norm_f,
                     "global_step": global_step,
                     "round": round_idx,
                     "eval_accuracy": float(client_eval_accuracy),
@@ -471,7 +501,7 @@ def _run_fed_training(  # noqa: C901
         final_accuracy = float(accuracy)
         final_confmat = confmat
         round_metrics["eval_accuracy"] = final_accuracy
-        round_metrics["confmat"] = confmat
+        round_metrics["confmat"] = confmat.detach().cpu()
         round_metrics["global_step"] = global_step
 
         logger.info(
@@ -551,8 +581,8 @@ def main(cfg: DictConfig) -> None:
         quiver = WandbQuiver(
             group=group,
             num_clients=config.num_clients,
-            entity="fedmat-team",
-            project="fedmat-project",
+            entity=config.wandb_entity,
+            project=config.wandb_project,
             config=asdict(config),
             mode="online",
             dir=str(config.output_dir),

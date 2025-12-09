@@ -1,0 +1,27 @@
+defaults:
+  - base
+  - _self_
+
+use_pretrained: false
+
+dataset: cifar10
+num_labels: 10
+num_workers: 8
+prefetch_factor: 2
+
+run_name: ${hydra:job.config_name}-c${num_clients}-l${local_steps}-b${batch_size}-h${homogeneity}-${now:%H-%M-%S}
+learning_rate: 5e-4
+lr_decay: .99
+lr_min: 1e-5
+batch_size: 256
+local_steps: 20
+max_train_samples: null
+max_eval_samples: null
+max_grad_norm: 1.0
+homogeneity: 1.0
+num_clients: 5
+num_rounds: 1000
+matcher: null
+optimizer: adamw_amsgrad
+
+save_final_checkpoint: false

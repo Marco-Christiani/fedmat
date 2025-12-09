@@ -49,7 +49,7 @@ def evaluate(
     num_labels = model.config.num_labels
     conf = torch.zeros((num_labels, num_labels), device=device, dtype=torch.long)
 
-    for batch in tqdm(dataloader, desc="Evaluating"):
+    for batch in dataloader:
         labels = batch["labels"].to(device=model.device)
 
         with torch.autocast(

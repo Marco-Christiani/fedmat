@@ -214,3 +214,5 @@ data
 
 # Run artifacts
 /outputs/
+multirun
+wandb

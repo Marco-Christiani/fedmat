@@ -255,6 +255,7 @@ def test_train_loop_parallelism_with_real_model(
         local_steps=8,
         max_grad_norm=None,
         log_every_n_steps=16,
+        enable_fed_weights=False,
         use_bf16=False,
         use_torch_compile=False,
         max_train_samples=None,

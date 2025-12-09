@@ -18,6 +18,7 @@ weight_decay: 0.01
 batch_size: ???
 local_steps: ???
 max_grad_norm: null
+enable_fed_weights: false
 
 homogeneity: 1.0
 num_clients: ???
@@ -41,3 +42,5 @@ dry: false
 enable_timing: true
 use_wandb: true
 per_client_init: false
+wandb_entity: fedmat-team
+wandb_project: fedmat-project
