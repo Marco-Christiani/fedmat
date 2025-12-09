@@ -6,9 +6,9 @@ import contextlib
 import copy
 import logging
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 import albumentations as A
 import cv2
@@ -22,7 +22,7 @@ from transformers import AutoImageProcessor, ViTForImageClassification
 from fedmat import install_exception_handlers, install_global_log_context, set_log_context
 from fedmat.data import Batch, build_dataloaders, load_named_dataset_subsets
 from fedmat.evaluate import evaluate
-from fedmat.train_utils import StateDict, WandbQuiver, aggregate_models, log_run_artifacts, FocalLoss
+from fedmat.train_utils import FocalLoss, StateDict, WandbQuiver, aggregate_models, log_run_artifacts
 from fedmat.utils import create_vit_classifier, default_device, get_amp_settings, set_seed
 
 if TYPE_CHECKING:
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
     from transformers.modeling_outputs import ImageClassifierOutput
 
-    from fedmat.config import TrainConfig, OptimizerConfig
+    from fedmat.config import OptimizerConfig, TrainConfig
 
 logger = logging.getLogger(__name__)
 cv2.setNumThreads(0)
@@ -44,10 +44,42 @@ class MetricRow(TypedDict):
     step: int  # local step index within round for this client
     global_step: int
     loss: float
+    train_accuracy: float
     gradient_norm: float
     clipped_gradient_norm: float
 
-def _build_optimizer(optimizer: OptimizerConfig, params: Iterator[torch.nn.parameter.Parameter], **kwargs) -> torch.optim.Optimizer:
+
+@dataclass
+class _PendingMetric:
+    """Bookkeeping for metrics whose kernels are still in flight on a stream."""
+
+    round_idx: int
+    client_idx: int
+    local_step: int
+    global_step: int
+    loss: torch.Tensor
+    train_accuracy: torch.Tensor
+    gradient_norm: torch.Tensor
+    clipped_gradient_norm: torch.Tensor
+
+
+@dataclass
+class _PendingLog:
+    """Deferred logger payload that can be materialized after stream sync."""
+
+    round_idx: int
+    client_idx: int
+    local_step: int
+    global_step: int
+    loss_sum: torch.Tensor
+    steps: int
+
+
+def _build_optimizer(
+    optimizer: OptimizerConfig,
+    params: Iterator[torch.nn.parameter.Parameter],
+    **kwargs,
+) -> torch.optim.Optimizer:
     if optimizer == "sgd":
         target = torch.optim.SGD
     elif optimizer == "sgd_nesterov":
@@ -77,11 +109,57 @@ def _compute_gradient_norm(m: torch.nn.Module) -> torch.Tensor:
 def _models_delta_norm(am: torch.nn.Module, bm: torch.nn.Module) -> torch.Tensor:
     return torch.nn.utils.get_total_norm(ap - bm.get_parameter(name) for name, ap in am.named_parameters())
 
+
 def _client_histograms_to_client_class_weights(client_histograms: torch.Tensor) -> torch.Tensor:
     inv_freq = (1 / client_histograms).nan_to_num()
     return inv_freq / inv_freq.sum(dim=1).unsqueeze(1)
 
-def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = None) -> float | None:
+
+def _finalize_pending_metrics(
+    pending_metrics: list[_PendingMetric],
+    pending_logs: list[_PendingLog],
+    all_train_metrics: list[MetricRow],
+    round_idx: int,
+    quiver: WandbQuiver | None,
+    device: torch.device,
+) -> None:
+    """Convert deferred metric tensors to host values after stream sync."""
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    for metric in pending_metrics:
+        metrics_payload: MetricRow = {
+            "round": metric.round_idx,
+            "client": metric.client_idx,
+            "step": metric.local_step,
+            "loss": float(metric.loss.item()),
+            "train_accuracy": float(metric.train_accuracy.item()),
+            "global_step": metric.global_step,
+            "clipped_gradient_norm": float(metric.clipped_gradient_norm.item()),
+            "gradient_norm": float(metric.gradient_norm.item()),
+        }
+        all_train_metrics.append(metrics_payload)
+        if quiver is not None:
+            quiver.client_runs[metric.client_idx].log(metrics_payload)
+    pending_metrics.clear()
+
+    for log_payload in pending_logs:
+        avg_loss = float((log_payload.loss_sum / max(log_payload.steps, 1)).item())
+        logger.info(
+            "Round %d client %d local_step %d global_step %d avg_loss=%.4f",
+            round_idx + 1,
+            log_payload.client_idx + 1,
+            log_payload.local_step,
+            log_payload.global_step,
+            avg_loss,
+        )
+    pending_logs.clear()
+
+
+def _run_fed_training(  # noqa: C901
+    train_config: TrainConfig,
+    quiver: WandbQuiver | None = None,
+) -> float | None:
     """Execute the federated training loop with per-step multi-client scheduling."""
     device = default_device()
     logger.info("Using device: %s", device)
@@ -158,12 +236,14 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
     use_autocast, amp_dtype = get_amp_settings(device, train_config.use_bf16)
 
     for round_idx in range(train_config.num_rounds):
-        round_metrics: dict[str, float | torch.Tensor] = { "round": round_idx }
+        round_metrics: dict[str, float | torch.Tensor] = {"round": round_idx}
         logger.info(
             "Starting round %d/%d",
             round_idx + 1,
             train_config.num_rounds,
         )
+        pending_metrics: list[_PendingMetric] = []
+        pending_logs: list[_PendingLog] = []
 
         learning_rate = train_config.learning_rate * (train_config.lr_decay ** round_idx)
         round_metrics["learning_rate"] = learning_rate
@@ -192,7 +272,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                 lr=learning_rate,
                 weight_decay=train_config.weight_decay,
             )
-            criterion = FocalLoss(gamma=5.0, alpha=client_class_weights[client_idx]) # we can weigh focalloss now
+            criterion = FocalLoss(gamma=5.0, alpha=client_class_weights[client_idx])  # we can weigh focalloss now
             _ = criterion.to(device=device)  # type: ignore
 
             client_models.append(client_model)
@@ -216,6 +296,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         # Local training: step-major, client-minor loop
         for local_step in range(local_steps):
             for client_idx in range(train_config.num_clients):
+                current_global_step = global_step
                 stream = streams[client_idx]
                 client_model = client_models[client_idx]
                 optimizer = client_optimizers[client_idx]
@@ -233,8 +314,9 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
 
                 client_model.train()
 
-                pixel_values = batch["pixel_values"].to(device)
-                labels = batch["labels"].to(device)
+                non_blocking = device.type == "cuda"
+                pixel_values = batch["pixel_values"].to(device, non_blocking=non_blocking)
+                labels = batch["labels"].to(device, non_blocking=non_blocking)
 
                 ctx = (
                     torch.cuda.stream(stream)
@@ -252,7 +334,7 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     loss.backward()
 
                     # Log gradient norm
-                    gradient_norm = float(_compute_gradient_norm(client_model))
+                    gradient_norm = _compute_gradient_norm(client_model).detach()
                     clipped_gradient_norm = gradient_norm
 
                     if train_config.max_grad_norm is not None:
@@ -260,11 +342,12 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                             client_model.parameters(),
                             train_config.max_grad_norm,
                         )
-                        clipped_gradient_norm = float(_compute_gradient_norm(client_model))
+                        clipped_gradient_norm = _compute_gradient_norm(client_model).detach()
 
                     optimizer.step()
 
                     loss_det = loss.detach()
+                    batch_accuracy_det = batch_accuracy.detach()
 
                     # Metrics and logging bookkeeping
                     steps_since_log[client_idx] += 1
@@ -275,20 +358,16 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     else:
                         running_loss_gpu[client_idx] = running_loss_gpu[client_idx] + loss_det
 
-                    # Log metrics for this batch
-                    batch_metrics: MetricRow = {
-                        "round": round_idx,
-                        "client": client_idx,
-                        "step": local_step,
-                        "loss": float(loss_det.item()),  # sync
-                        "train_accuracy": float(batch_accuracy),
-                        "global_step": global_step,
-                        "clipped_gradient_norm": clipped_gradient_norm,
-                        "gradient_norm": gradient_norm,
-                    }
-                    all_train_metrics.append(batch_metrics)
-                    if quiver is not None:
-                        quiver.client_runs[client_idx].log(batch_metrics)
+                    pending_metrics.append(_PendingMetric(
+                        round_idx=round_idx,
+                        client_idx=client_idx,
+                        local_step=local_step,
+                        global_step=current_global_step,
+                        loss=loss_det,
+                        train_accuracy=batch_accuracy_det,
+                        gradient_norm=gradient_norm,
+                        clipped_gradient_norm=clipped_gradient_norm,
+                    ))
 
                     # Logging - interval or round end
                     # do_log = (
@@ -297,16 +376,14 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
                     # )
                     do_log = ((local_step + 1) % train_config.log_every_n_steps == 0) or (local_step == local_steps - 1)
                     if do_log and running_loss_gpu[client_idx] is not None:
-                        avg_loss_gpu = running_loss_gpu[client_idx] / steps_since_log[client_idx]  # type: ignore
-                        avg_loss = float(avg_loss_gpu.item())  # sync
-                        logger.info(
-                            "Round %d client %d local_step %d global_step %d avg_loss=%.4f",
-                            round_idx + 1,
-                            client_idx + 1,
-                            local_step,
-                            global_step,
-                            avg_loss,
-                        )
+                        pending_logs.append(_PendingLog(
+                            round_idx=round_idx,
+                            client_idx=client_idx,
+                            local_step=local_step,
+                            global_step=current_global_step,
+                            loss_sum=running_loss_gpu[client_idx],
+                            steps=steps_since_log[client_idx],
+                        ))
                         running_loss_gpu[client_idx] = None
                         steps_since_log[client_idx] = 0
 
@@ -316,6 +393,15 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
         for s in streams:
             if s is not None:
                 s.synchronize()
+
+        _finalize_pending_metrics(
+            pending_metrics=pending_metrics,
+            pending_logs=pending_logs,
+            all_train_metrics=all_train_metrics,
+            round_idx=round_idx,
+            quiver=quiver,
+            device=device,
+        )
 
         round_metrics["global_step"] = global_step
 
@@ -416,6 +502,9 @@ def _run_fed_training(train_config: TrainConfig, quiver: WandbQuiver | None = No
             "step": pl.Int64,
             "global_step": pl.Int64,
             "loss": pl.Float64,
+            "train_accuracy": pl.Float64,
+            "gradient_norm": pl.Float64,
+            "clipped_gradient_norm": pl.Float64,
         },
     )
 
