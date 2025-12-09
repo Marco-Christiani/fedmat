@@ -1,6 +1,6 @@
 defaults:
-  - matcher: null
   - base
+  - matcher: null
   - _self_
 
 _target_: fedmat.config.TrainConfig
@@ -32,5 +32,3 @@ dataset: cifar10
 num_labels: 10
 max_train_samples: 50000
 max_eval_samples: 1000
-
-output_dir: ${hydra:runtime.output_dir}/vit_cifar10

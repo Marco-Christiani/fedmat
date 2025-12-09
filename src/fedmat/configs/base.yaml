@@ -15,12 +15,13 @@ max_eval_samples: ???
 
 learning_rate: ???
 weight_decay: 0.01
+lr_min: 1e-5
 batch_size: ???
 local_steps: ???
 max_grad_norm: null
-enable_fed_weights: false
 
 homogeneity: 1.0
+enable_fed_weights: false
 num_clients: ???
 num_rounds: ???
 
